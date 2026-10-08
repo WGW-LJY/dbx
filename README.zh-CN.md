@@ -153,7 +153,7 @@
       </a>
     </td>
     <td>
-      七牛云为 DBX 提供对象存储、CDN 等云基础设施资源支持。
+      七牛云为 DBX 提供对象存储、CDN等云基础设施资源支持。
       <a href="https://www.qiniu.com/" target="_blank">访问七牛云</a>
     </td>
   </tr>
