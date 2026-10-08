@@ -1078,6 +1078,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
@@ -1116,6 +1117,7 @@ mod tests {
             ssh_agent_sock_path: String::new(),
             auth_method: "key".to_string(),
             allow_exec_channel_proxy: false,
+            proxy_command: String::new(),
         }
     }
 

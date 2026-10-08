@@ -464,7 +464,9 @@ LIMIT 100;`);
 
     const formatted = await formatSqlForEditing(sql, sqlFormatDialectForDbType("dameng"));
 
-    expect(formatted).toContain('JS1.REC_CREATOR AS "recCreator"');
+    const aliasLines = formatted.split("\n").filter((line) => line.includes(' AS "recCreator'));
+    expect(aliasLines).toHaveLength(2);
+    expect(aliasLines[0]!.indexOf(" AS ")).toBe(aliasLines[1]!.indexOf(" AS "));
     // Known and unknown functions alike are written without a space before the
     // parenthesis.
     expect(formatted).toContain("DECODE(");
@@ -629,5 +631,22 @@ AND owner_id = 42`,
 
     expect(formatted).toContain("SELECT");
     expect(formatted).toContain("::jsonb");
+  });
+
+  it("formats multiline items with leading comma position", async () => {
+    const sql = "SELECT col1, col2, col3 FROM tbl WHERE a = 1;";
+    const formatted = await formatSqlText(sql, "generic", { commaPosition: "before", indentStyle: "tabularLeft" });
+
+    expect(formatted).toContain(", col2");
+    expect(formatted).toContain(", col3");
+    expect(formatted).not.toMatch(/col1,/);
+  });
+
+  it("preserves line comments when formatting with leading comma position", async () => {
+    const sql = "SELECT\n  col1, -- first column\n  col2 -- second column\nFROM tbl;";
+    const formatted = await formatSqlText(sql, "generic", { commaPosition: "before", indentStyle: "tabularLeft" });
+
+    expect(formatted).toContain("col1 -- first column");
+    expect(formatted).toMatch(/,\s*col2\s*-- second column/);
   });
 });

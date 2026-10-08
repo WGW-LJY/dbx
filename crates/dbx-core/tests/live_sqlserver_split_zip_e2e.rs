@@ -68,6 +68,7 @@ fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connecti
         redis_scan_page_size: None,
         redis_database_aliases: Default::default(),
         redis_key_templates: Vec::new(),
+        redis_key_filter: None,
         redis_key_grouping: None,
         etcd_endpoints: String::new(),
         gbase_server: String::new(),
@@ -130,6 +131,7 @@ async fn manual_e2e_sqlserver_default_split_zip_export_then_import_skip_relation
         include_create_database: false,
         drop_table_if_exists: true,
         omit_auto_increment: false,
+        preserve_original_language: false,
         fail_on_error: true,
         prevent_overwrite: false,
         output_compression: DatabaseExportOutputCompression::None,
@@ -137,6 +139,7 @@ async fn manual_e2e_sqlserver_default_split_zip_export_then_import_skip_relation
         batch_size: 1000,
         split_max_mb: Some(1),
         insert_dialect: Default::default(),
+        insert_mode: Default::default(),
     };
 
     let progress_log = std::sync::Mutex::new(Vec::new());

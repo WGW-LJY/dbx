@@ -88,6 +88,7 @@ import { MQ_PINNED_VERSION_OPTIONS, pinnedVersionToSelection, selectionToPinnedV
 import { mongodbAuthFailureHint, mongoConnectionUsesOidc, mongoUrlParam, mongoUrlParamIsTrue, normalizeMongoTlsFormState, setMongoUrlParam, setMongoUrlParamBoolean } from "@/lib/mongo/mongoConnectionOptions";
 import { isMongoLegacyDriverProfile } from "@/lib/mongo/mongoCapabilities";
 import { mysqlCleartextPasswordAuthEnabled, setMysqlCleartextPasswordAuthEnabled } from "@/lib/database/mysqlConnectionOptions";
+import { supportsOracleDatabaseLinks } from "@/lib/database/oracleDatabaseLinks";
 import { applyDamengSslUrlParams, damengSslFormConfig } from "@/lib/database/damengSslOptions";
 import { DAMENG_BUILTIN_DRIVER_PROFILE, DAMENG_CUSTOM_DRIVER_PROFILE, DAMENG_DEFAULT_JDBC_DRIVER_CLASS, damengCustomJdbcUrl, damengDriverModeForConfig, defaultDamengJdbcUrl, type DamengDriverMode } from "@/lib/database/damengDriverOptions";
 import { doltSystemTablesVisible, isDoltDriverProfile, setDoltSystemTablesVisible } from "@/lib/database/doltProfile";
@@ -440,6 +441,7 @@ const defaultForm = (): ConnectionForm => ({
   redis_key_separator: ":",
   redis_scan_page_size: REDIS_SCAN_PAGE_SIZE_DEFAULT,
   redis_key_templates: [],
+  redis_key_filter: "",
   etcd_endpoints: "",
   gbase_server: "",
   informix_server: "",
@@ -448,6 +450,7 @@ const defaultForm = (): ConnectionForm => ({
   docs_notes_path: undefined,
   read_only: false,
   show_system_schemas: false,
+  show_database_links: true,
   sidebar_auto_load_all_tables: false,
   is_production: false,
   production_databases: [],
@@ -508,6 +511,7 @@ function defaultSshTunnel(): SshTunnelConfig {
     ssh_agent_sock_path: "",
     auth_method: "password",
     allow_exec_channel_proxy: false,
+    proxy_command: "",
   };
 }
 
@@ -528,6 +532,7 @@ function normalizeSshTunnel(hop: Partial<SshTunnelConfig>): SshTunnelConfig {
     ssh_agent_sock_path: hop.ssh_agent_sock_path || "",
     auth_method: hop.auth_method || inferSshAuthMethod(hop),
     allow_exec_channel_proxy: !!hop.allow_exec_channel_proxy,
+    proxy_command: hop.proxy_command || "",
     profile_id: hop.profile_id || undefined,
   };
 }
@@ -3127,6 +3132,7 @@ watch(
         redis_key_separator: config.redis_key_separator ?? ":",
         redis_scan_page_size: config.redis_scan_page_size ?? REDIS_SCAN_PAGE_SIZE_DEFAULT,
         redis_key_templates: normalizeRedisKeyTemplates(config.redis_key_templates),
+        redis_key_filter: config.redis_key_filter ?? "",
         redis_key_grouping: config.redis_key_grouping,
         etcd_endpoints: config.etcd_endpoints || "",
         gbase_server: config.gbase_server || "",
@@ -3137,6 +3143,7 @@ watch(
         docs_notes_path: config.docs_notes_path,
         read_only: config.read_only || false,
         show_system_schemas: config.show_system_schemas || false,
+        show_database_links: config.show_database_links !== false,
         sidebar_auto_load_all_tables: config.sidebar_auto_load_all_tables === true,
         is_production: config.is_production || false,
         production_databases: config.production_databases || [],
@@ -3935,6 +3942,20 @@ const postgresClientKeyPath = computed({
   get: () => getUrlParam(form.value.url_params, "sslkey"),
   set: (value: string) => {
     form.value.url_params = setUrlParam(form.value.url_params, "sslkey", value);
+  },
+});
+// Firebird 的 Java 驱动（Jaybird）默认按 JVM 编码（UTF-8）解码 CHARACTER SET NONE
+// 字段，历史数据若以 GBK 等编码存放就会显示为乱码。这里把连接字符集映射到 JDBC URL 的
+// charSet 参数（复用通用 URL 参数通道），交给用户按数据实际编码选择。
+const FIREBIRD_CHARSET_OPTIONS = ["UTF8", "GBK", "GB18030", "BIG5", "ISO8859_1", "Cp1252"];
+const firebirdCharsetItems = computed(() => {
+  const current = getUrlParam(form.value.url_params, "charSet");
+  return current && !FIREBIRD_CHARSET_OPTIONS.includes(current) ? [current, ...FIREBIRD_CHARSET_OPTIONS] : FIREBIRD_CHARSET_OPTIONS;
+});
+const firebirdCharset = computed({
+  get: () => getUrlParam(form.value.url_params, "charSet") || "default",
+  set: (value: string) => {
+    form.value.url_params = setUrlParam(form.value.url_params, "charSet", value === "default" ? "" : value);
   },
 });
 const redisTlsInsecure = computed({
@@ -5142,6 +5163,7 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     config.redis_scan_page_size = undefined;
     config.redis_database_aliases = undefined;
     config.redis_key_templates = undefined;
+    config.redis_key_filter = undefined;
     config.redis_key_grouping = undefined;
   } else if (config.redis_connection_mode === "sentinel") {
     config.redis_sentinel_master = config.redis_sentinel_master?.trim() || "";
@@ -5176,6 +5198,7 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
   }
   if (config.db_type === "redis") {
     config.redis_key_separator = config.redis_key_separator?.trim() ?? ":";
+    config.redis_key_filter = config.redis_key_filter?.trim() || undefined;
     const scanSize = Number(config.redis_scan_page_size);
     config.redis_scan_page_size = Number.isFinite(scanSize) && scanSize >= REDIS_SCAN_PAGE_SIZE_MIN && scanSize <= REDIS_SCAN_PAGE_SIZE_MAX ? Math.round(scanSize) : REDIS_SCAN_PAGE_SIZE_DEFAULT;
     {
@@ -5366,6 +5389,7 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     config.visible_databases = Array.isArray(config.visible_databases) && config.visible_databases.length > 0 ? config.visible_databases : undefined;
   }
   if (!config.show_system_schemas) config.show_system_schemas = undefined;
+  if (config.show_database_links !== false) config.show_database_links = undefined;
   if (!config.sidebar_auto_load_all_tables) config.sidebar_auto_load_all_tables = undefined;
   if (config.visible_schemas && Object.keys(config.visible_schemas).length === 0) config.visible_schemas = undefined;
   if (config.agent_java_options && config.agent_java_options.length === 0) config.agent_java_options = undefined;
@@ -8084,6 +8108,13 @@ function openExternalUrl(url: string) {
                       <Input v-model="form.redis_key_separator" class="col-span-3 h-8 text-xs" placeholder=":" />
                     </div>
                     <div class="grid grid-cols-4 items-start gap-4">
+                      <Label for="redis-key-filter" :class="connectionLabelTopClass">{{ t("connection.redisKeyFilter") }}</Label>
+                      <div class="col-span-3 space-y-1">
+                        <Input id="redis-key-filter" v-model="form.redis_key_filter" class="h-8 text-xs" placeholder="order:*" spellcheck="false" />
+                        <p class="text-xs text-muted-foreground">{{ t("connection.redisKeyFilterHint") }}</p>
+                      </div>
+                    </div>
+                    <div class="grid grid-cols-4 items-start gap-4">
                       <Label :class="connectionLabelTopClass">{{ t("connection.redisKeyTemplates") }}</Label>
                       <div class="col-span-3 space-y-1">
                         <textarea
@@ -9349,6 +9380,24 @@ function openExternalUrl(url: string) {
                       </label>
                     </div>
 
+                    <div v-if="form.db_type === 'firebird'" class="grid grid-cols-4 items-start gap-4">
+                      <Label :class="connectionLabelTopClass">{{ t("connection.firebirdCharset") }}</Label>
+                      <div class="col-span-3 space-y-1.5">
+                        <Select v-model="firebirdCharset">
+                          <SelectTrigger class="h-9">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="default">{{ t("common.default") }}</SelectItem>
+                            <SelectItem v-for="charset in firebirdCharsetItems" :key="charset" :value="charset">{{ charset }}</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <p class="text-xs leading-5 text-muted-foreground">
+                          {{ t("connection.firebirdCharsetHint") }}
+                        </p>
+                      </div>
+                    </div>
+
                     <div v-if="supportsGenericUrlParams" class="connection-url-params-row grid grid-cols-4 items-start gap-4" :class="{ 'connection-url-params-row--compact': !showGenericUrlParamsHint, 'connection-url-params-row--with-hint': showGenericUrlParamsHint }">
                       <Label :class="[connectionLabelClass, 'connection-url-params-label']">{{ t("connection.urlParams") }}</Label>
                       <div class="col-span-3 space-y-1.5">
@@ -9375,7 +9424,9 @@ function openExternalUrl(url: string) {
                                               ? 'localdatacenter=dc1'
                                               : form.db_type === 'transwarp'
                                                 ? 'fetchSize=500;auth=noSasl'
-                                                : 'sslmode=prefer'
+                                                : form.db_type === 'firebird'
+                                                  ? 'charSet=GBK'
+                                                  : 'sslmode=prefer'
                           "
                         />
                         <p v-if="showGenericUrlParamsHint" class="text-xs leading-5 text-muted-foreground">
@@ -10235,6 +10286,13 @@ function openExternalUrl(url: string) {
                     <span class="text-xs text-muted-foreground">{{ t("connection.showSystemSchemasHint") }}</span>
                   </label>
                 </div>
+                <div v-if="supportsOracleDatabaseLinks(form.db_type)" class="grid grid-cols-4 items-center gap-4">
+                  <Label :class="connectionLabelSmallClass">{{ t("connection.showDatabaseLinks") }}</Label>
+                  <label class="col-span-3 flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" v-model="form.show_database_links" class="mr-0" />
+                    <span class="text-xs text-muted-foreground">{{ t("connection.showDatabaseLinksHint") }}</span>
+                  </label>
+                </div>
                 <div v-if="supportsAutomaticTableLoading" class="grid grid-cols-4 items-start gap-4">
                   <Label :class="connectionLabelSmallPaddedClass">{{ t("connection.tableLoading") }}</Label>
                   <div class="col-span-3 grid gap-1.5">
@@ -10498,6 +10556,13 @@ function openExternalUrl(url: string) {
                         <input type="checkbox" v-model="selectedSshLayer.allow_exec_channel_proxy" class="mt-0.5 mr-0" :disabled="selectedSshLayer.enabled === false" />
                         <span class="text-xs text-muted-foreground">{{ t("connection.sshAllowExecChannelProxy") }}</span>
                       </label>
+                    </div>
+                    <div class="grid grid-cols-4 items-start gap-4">
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshProxyCommand") }}</Label>
+                      <div class="col-span-3 space-y-1">
+                        <Input v-model="selectedSshLayer.proxy_command" :placeholder="t('connection.sshProxyCommandPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
+                        <p class="text-xs text-muted-foreground">{{ t("connection.sshProxyCommandHint") }}</p>
+                      </div>
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.sshConnectTimeout") }}</Label>

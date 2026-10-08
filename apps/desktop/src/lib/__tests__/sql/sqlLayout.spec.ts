@@ -188,9 +188,28 @@ describe("sql layout", () => {
 
   it("keeps nested and simple CASE expressions compact", async () => {
     const sql = "SELECT SUM(CASE WHEN a = 1 AND b = 2 THEN 1 ELSE 0 END) AS total, CASE a WHEN 1 THEN CASE b WHEN 2 THEN 'x  y' END ELSE 'other' END AS label FROM t;";
-    const expected = lines("SELECT SUM(CASE WHEN a = 1 AND b = 2 THEN 1 ELSE 0 END) AS total,", "       CASE a WHEN 1 THEN CASE b WHEN 2 THEN 'x  y' END ELSE 'other' END AS label", "FROM t;");
+    const expected = lines("SELECT SUM(CASE WHEN a = 1 AND b = 2 THEN 1 ELSE 0 END)                  AS total,", "       CASE a WHEN 1 THEN CASE b WHEN 2 THEN 'x  y' END ELSE 'other' END AS label", "FROM t;");
     expect(await format(sql)).toBe(expected);
     expect(await format(expected)).toBe(expected);
+  });
+
+  it("falls back to unaligned fields when an aligned alias would overflow the line width", async () => {
+    // Alignment pads every alias to one column past the widest expression, so
+    // the short expression's long alias lands exactly at the 120-column width;
+    // one more character and the whole list keeps the plain one-space layout.
+    const fitting = `SELECT ${"a".repeat(60)} AS total, ${"b".repeat(30)} AS ${"y".repeat(49)} FROM t;`;
+    expect(await format(fitting)).toBe(lines(`SELECT ${"a".repeat(60)} AS total,`, `       ${"b".repeat(30)}${" ".repeat(31)}AS ${"y".repeat(49)}`, "FROM t;"));
+
+    const overflowing = `SELECT ${"a".repeat(60)} AS total, ${"b".repeat(30)} AS ${"y".repeat(50)} FROM t;`;
+    expect(await format(overflowing)).toBe(lines(`SELECT ${"a".repeat(60)} AS total,`, `       ${"b".repeat(30)} AS ${"y".repeat(50)}`, "FROM t;"));
+  });
+
+  it("keeps an unaliased field plain while the aliased ones align", async () => {
+    expect(await format("SELECT a, b AS x, c AS yyy FROM t;")).toBe(lines("SELECT a,", "       b AS x,", "       c AS yyy", "FROM t;"));
+
+    // The alignment column comes from the aliased expressions only, so the
+    // bare field stays untouched beside the padded aliases.
+    expect(await format("SELECT a, bb AS x, c AS yyy FROM t;")).toBe(lines("SELECT a,", "       bb AS x,", "       c  AS yyy", "FROM t;"));
   });
 
   it("preserves comments and width wrapping inside CASE expressions", async () => {
@@ -301,5 +320,43 @@ describe("sql layout", () => {
 
   it("formats a dialect without its own grammar", async () => {
     expect(await format("select * from t where a = 1 and b = 2;", {}, "generic")).toBe("SELECT * FROM t WHERE a = 1 AND b = 2;");
+  });
+
+  it("formats a query with leading comma position (#7723, #5110)", async () => {
+    const sql = lines("SELECT loc_id, loc_name, loc_type, delivery_emp_num, update_time", "FROM tbl", "WHERE rn = 1;");
+
+    expect(await format(sql, { commaPosition: "before" })).toBe(lines("SELECT loc_id", "     , loc_name", "     , loc_type", "     , delivery_emp_num", "     , update_time", "FROM tbl", "WHERE rn = 1;"));
+  });
+
+  it("formats aligned projection aliases with leading commas", async () => {
+    const sql = lines("SELECT id AS emp_id, department_name AS dept, active_status AS status", "FROM employees;");
+
+    expect(await format(sql, { commaPosition: "before" })).toBe(lines("SELECT id              AS emp_id", "     , department_name AS dept", "     , active_status   AS status", "FROM employees;"));
+  });
+
+  it("formats CREATE TABLE with leading commas in DDL", async () => {
+    const sql = lines(
+      "CREATE TABLE IF NOT EXISTS `delivery_emp_info`",
+      "(",
+      "  `id` varchar(20) PRIMARY KEY NOT NULL COMMENT '主键',",
+      "  `emp_id` varchar(20) NOT NULL COMMENT '员工id',",
+      "  `delivery_type_ids` varchar(512) DEFAULT NULL COMMENT '负责的运送类型id集合',",
+      "  `update_time` datetime NOT NULL COMMENT '更新时间',",
+      "  CONSTRAINT idx_emp_phone UNIQUE (emp_id, emp_phone_num) COMMENT '运送员id电话唯一'",
+      ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin COMMENT '运达员信息表';",
+    );
+
+    expect(await format(sql, { commaPosition: "before" })).toBe(
+      lines(
+        "CREATE TABLE IF NOT EXISTS `delivery_emp_info`",
+        "(",
+        "    `id`                varchar(20)  PRIMARY KEY NOT NULL COMMENT '主键'",
+        "  , `emp_id`            varchar(20)              NOT NULL COMMENT '员工id'",
+        "  , `delivery_type_ids` varchar(512)         DEFAULT NULL COMMENT '负责的运送类型id集合'",
+        "  , `update_time`       datetime                 NOT NULL COMMENT '更新时间'",
+        "  , CONSTRAINT idx_emp_phone UNIQUE (emp_id, emp_phone_num) COMMENT '运送员id电话唯一'",
+        ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin COMMENT '运达员信息表';",
+      ),
+    );
   });
 });
