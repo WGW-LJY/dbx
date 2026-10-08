@@ -259,7 +259,7 @@ async fn live_postgres_transfer_upserts_generated_always_identity_values() {
         drop_target_before_create: false,
         drop_target_confirmed: false,
         content: dbx_core::transfer::TransferContent::default(),
-        objects: Vec::new(),
+        objects: Some(Vec::new()),
         mode: TransferMode::Upsert,
         target_table_name_case: TransferTableNameCase::Preserve,
         quote_target_column_names: true,
@@ -437,7 +437,7 @@ async fn live_postgres_structure_only_preserves_table_indexes() {
         drop_target_before_create: false,
         drop_target_confirmed: false,
         content: dbx_core::transfer::TransferContent::default(),
-        objects: Vec::new(),
+        objects: Some(Vec::new()),
         mode: TransferMode::Append,
         target_table_name_case: TransferTableNameCase::Preserve,
         quote_target_column_names: true,
@@ -722,7 +722,7 @@ async fn live_postgres_transfer_preserves_data_and_schema_objects() {
         drop_target_before_create: false,
         drop_target_confirmed: false,
         content: dbx_core::transfer::TransferContent::default(),
-        objects: Vec::new(),
+        objects: None,
         mode: TransferMode::Append,
         target_table_name_case: TransferTableNameCase::Preserve,
         quote_target_column_names: true,
@@ -1025,7 +1025,7 @@ async fn live_postgres_transfer_skips_create_ddl_for_existing_target_table() {
         drop_target_before_create: false,
         drop_target_confirmed: false,
         content: dbx_core::transfer::TransferContent::default(),
-        objects: Vec::new(),
+        objects: Some(Vec::new()),
         mode: TransferMode::Append,
         target_table_name_case: TransferTableNameCase::Preserve,
         quote_target_column_names: true,
@@ -1150,13 +1150,13 @@ async fn live_postgres_transfer_creates_selected_sequence_before_referencing_tab
         drop_target_before_create: false,
         drop_target_confirmed: false,
         content: dbx_core::transfer::TransferContent::default(),
-        objects: vec![
+        objects: Some(vec![
             TransferObjectSelection { object_type: TransferObjectKind::Table, names: vec!["biz_banner".to_string()] },
             TransferObjectSelection {
                 object_type: TransferObjectKind::Sequence,
                 names: vec!["biz_banner_id_seq".to_string()],
             },
-        ],
+        ]),
         mode: TransferMode::Append,
         target_table_name_case: TransferTableNameCase::Preserve,
         quote_target_column_names: true,
@@ -1342,7 +1342,7 @@ async fn live_postgres_transfer_drop_target_rebuilds_structure_and_indexes() {
         drop_target_before_create: true,
         drop_target_confirmed: true,
         content: TransferContent::default(),
-        objects: Vec::new(),
+        objects: Some(Vec::new()),
         mode: TransferMode::Append,
         target_table_name_case: TransferTableNameCase::Preserve,
         quote_target_column_names: true,
@@ -1544,7 +1544,7 @@ impl PostgresRebuildFixture {
                 drop_target_before_create: true,
                 drop_target_confirmed: true,
                 content: TransferContent::default(),
-                objects: Vec::new(),
+                objects: Some(Vec::new()),
                 mode: TransferMode::Append,
                 target_table_name_case: TransferTableNameCase::Preserve,
                 quote_target_column_names: true,
@@ -1868,7 +1868,7 @@ async fn live_postgres_keyset_pagination_copies_every_row() {
         drop_target_before_create: false,
         drop_target_confirmed: false,
         content: TransferContent::default(),
-        objects: Vec::new(),
+        objects: Some(Vec::new()),
         mode: TransferMode::Append,
         target_table_name_case: TransferTableNameCase::Preserve,
         quote_target_column_names: true,
@@ -1981,7 +1981,7 @@ async fn live_postgres_progress_read_survives_total_duration_beyond_timeout() {
         drop_target_before_create: false,
         drop_target_confirmed: false,
         content: TransferContent::default(),
-        objects: Vec::new(),
+        objects: Some(Vec::new()),
         mode: TransferMode::Append,
         target_table_name_case: TransferTableNameCase::Preserve,
         quote_target_column_names: true,
@@ -2088,7 +2088,7 @@ async fn live_postgres_keyset_large_batch_copies_every_row() {
         drop_target_before_create: false,
         drop_target_confirmed: false,
         content: TransferContent::default(),
-        objects: Vec::new(),
+        objects: Some(Vec::new()),
         mode: TransferMode::Append,
         target_table_name_case: TransferTableNameCase::Preserve,
         quote_target_column_names: true,
@@ -2201,10 +2201,10 @@ async fn live_postgres_structure_only_preview_renders_ddl_without_touching_the_t
         drop_target_confirmed: false,
         content: TransferContent::StructureOnly,
         // A selected non-table object must be disclosed as not expanded, never silently dropped.
-        objects: vec![TransferObjectSelection {
+        objects: Some(vec![TransferObjectSelection {
             object_type: TransferObjectKind::Function,
             names: vec!["preview_probe_function".to_string()],
-        }],
+        }]),
         mode: TransferMode::Append,
         target_table_name_case: TransferTableNameCase::Preserve,
         quote_target_column_names: true,
@@ -2270,7 +2270,7 @@ async fn live_postgres_structure_only_preview_renders_ddl_without_touching_the_t
     let mut missing_schema_request = request.clone();
     missing_schema_request.transfer_id = format!("live-pg-preview-missing-{suffix}");
     missing_schema_request.target_schema = missing_target_schema.clone();
-    missing_schema_request.objects = Vec::new();
+    missing_schema_request.objects = Some(Vec::new());
     let missing_preview = preview_transfer_ownership(
         &state,
         &missing_schema_request,
