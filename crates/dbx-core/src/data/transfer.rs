@@ -5362,30 +5362,6 @@ async fn transfer_write_mysql_hard_limit(state: &AppState, pool_key: &str) -> Op
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(test), allow(dead_code))]
-/// Caps generated write batches by a MySQL-family target's `max_allowed_packet`
-/// (same pattern as `mysql_import_sql_hard_limit`); non-MySQL pools and failed
-/// probes fall back to None / a conservative constant respectively.
-async fn transfer_write_mysql_hard_limit(state: &AppState, pool_key: &str) -> Option<usize> {
-    let pool = {
-        let pool_handle = state.pool_handle(pool_key).await;
-        match pool_handle.as_ref() {
-            Some(PoolKind::Mysql(pool, _)) => pool.clone(),
-            _ => return None,
-        }
-    };
-    match crate::db::mysql::max_allowed_packet(&pool).await {
-        Ok(packet_bytes) => crate::db::mysql::mysql_sql_statement_hard_limit(packet_bytes),
-        Err(error) => {
-            log::debug!(
-                "[transfer] MySQL max_allowed_packet query failed; using the conservative write batch size: {error}"
-            );
-            Some(TRANSFER_WRITE_SQL_FALLBACK_BYTES)
-        }
-    }
-}
-
 fn generate_transfer_write_sql_batches(
     mode: &TransferMode,
     columns: &[String],

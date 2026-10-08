@@ -100,7 +100,7 @@ const objectGroups = ref<Partial<Record<TransferObjectKind, string[]>>>({});
 const selectedObjects = ref<Partial<Record<TransferObjectKind, Set<string>>>>({});
 const objectSearch = ref("");
 const loadingObjects = ref(false);
-const transferContent = ref<TransferContent>("structureAndData");
+const transferContent = ref<TransferContent>("dataOnly");
 
 const selectedTables = computed(() => new Set(selectedObjects.value.TABLE ?? []));
 const selectedTableList = computed(() => [...selectedTables.value]);
@@ -203,7 +203,6 @@ const tableFilters = ref<Record<string, string>>({});
 const filterDialogOpen = ref(false);
 const filterEditingTable = ref("");
 const filterDraft = ref("");
-const showRebuildConfirm = ref(false);
 const isSubmitting = ref(false);
 const pendingTransferId = ref<string | null>(null);
 const showStartConfirm = ref(false);
@@ -759,7 +758,7 @@ function resetState(cancelTaskLoad = true) {
   targetSchemas.value = [];
   targetSchema.value = "";
   pendingTargetSchemaPrefill.value = "";
-  transferContent.value = "structureAndData";
+  transferContent.value = "dataOnly";
   selectedStrategy.value = "append";
   targetTableNameCase.value = "preserve";
   quoteTargetColumnNames.value = true;
