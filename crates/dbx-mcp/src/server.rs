@@ -1178,7 +1178,7 @@ impl DbxMcpServer {
 
     #[tool(
         name = "dbx_list_connections",
-        description = "List database connections configured in DBX. Returns connection IDs, names, group paths, database types, endpoints, and selected databases."
+        description = "List database connections configured in DBX. Returns connection IDs, names, group paths, database types, endpoints, selected databases, and saved connection notes."
     )]
     async fn list_connections(
         &self,
@@ -3774,19 +3774,14 @@ impl ServerHandler for DbxMcpServer {
             .then(|| {
                 Resource::new(CONNECTIONS_RESOURCE_URI, "dbx_connections")
                     .with_title("DBX connections")
-                    .with_description("Database connections visible to the current DBX MCP scope")
+                    .with_description(
+                        "Database connections visible to the current DBX MCP scope, including saved notes",
+                    )
                     .with_mime_type("text/markdown")
             })
             .into_iter()
             .collect();
-        Ok(ListResourcesResult {
-            result_type: None,
-            meta: None,
-            next_cursor: None,
-            ttl_ms: None,
-            cache_scope: None,
-            resources,
-        })
+        Ok(ListResourcesResult::with_all_items(resources))
     }
 
     async fn list_resource_templates(
@@ -3821,14 +3816,7 @@ impl ServerHandler for DbxMcpServer {
                     .with_mime_type("text/markdown"),
             );
         }
-        Ok(ListResourceTemplatesResult {
-            result_type: None,
-            meta: None,
-            next_cursor: None,
-            ttl_ms: None,
-            cache_scope: None,
-            resource_templates,
-        })
+        Ok(ListResourceTemplatesResult::with_all_items(resource_templates))
     }
 
     async fn read_resource(
@@ -3878,14 +3866,7 @@ impl ServerHandler for DbxMcpServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
-        Ok(rmcp::model::ListToolsResult {
-            result_type: None,
-            meta: None,
-            next_cursor: None,
-            ttl_ms: None,
-            cache_scope: None,
-            tools: self.policy_filtered_tools().await,
-        })
+        Ok(rmcp::model::ListToolsResult::with_all_items(self.policy_filtered_tools().await))
     }
 }
 
@@ -5011,11 +4992,11 @@ fn ambiguous_connections(name: &str, connections: &[dbx_core::models::connection
 
 fn format_connections(connections: &[ConnectionSummary]) -> String {
     let mut output = String::from(
-        "| ID | Name | Group Path | Type | Host | Port | Database |\n| --- | --- | --- | --- | --- | --- | --- |",
+        "| ID | Name | Group Path | Type | Host | Port | Database | Note |\n| --- | --- | --- | --- | --- | --- | --- | --- |",
     );
     for connection in connections {
         output.push_str(&format!(
-            "\n| {} | {} | {} | {} | {} | {} | {} |",
+            "\n| {} | {} | {} | {} | {} | {} | {} | {} |",
             escape_cell(&connection.id),
             escape_cell(&connection.name),
             escape_cell(&connection.group_path.join(" / ")),
@@ -5023,6 +5004,7 @@ fn format_connections(connections: &[ConnectionSummary]) -> String {
             escape_cell(&connection.host),
             connection.port,
             escape_cell(&connection.database),
+            escape_cell(&connection.note),
         ));
     }
     output
@@ -6261,10 +6243,14 @@ mod tests {
             port: 5432,
             database: "app".to_string(),
             group_path: vec!["Project|A".to_string(), "Staging\nWest".to_string()],
+            note: "Application | staging\nRead-only queries".to_string(),
         }]);
         assert!(output.contains("id\\|1"));
         assert!(output.contains("local pg"));
         assert!(output.contains("Project\\|A / Staging West"));
+        assert!(output.contains("| Database | Note |"));
+        assert!(output.contains("| Application \\| staging Read-only queries |"));
+        assert_eq!(output.lines().count(), 3);
     }
 
     #[test]
