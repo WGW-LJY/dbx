@@ -3365,7 +3365,7 @@ pub async fn get_table_comment(
     Ok(rows.first().and_then(|row| row.get::<&str, _>(0)).filter(|s| !s.is_empty()).map(|s| s.to_string()))
 }
 
-fn sqlserver_table_comment_sql(schema: &str, table: &str) -> String {
+pub fn sqlserver_table_comment_sql(schema: &str, table: &str) -> String {
     let s = schema.replace('\'', "''");
     let t = table.replace('\'', "''");
     format!(
@@ -3446,10 +3446,10 @@ pub async fn list_constraints(
                 match_type: None,
                 on_update: row.get::<&str, _>(7).filter(|value| !value.is_empty()).map(str::to_string),
                 on_delete: row.get::<&str, _>(8).filter(|value| !value.is_empty()).map(str::to_string),
-                deferrable: false,
-                initially_deferred: false,
-                enabled: row.get::<bool, _>(9).unwrap_or(true),
-                valid: row.get::<bool, _>(10).unwrap_or(true),
+                deferrable: Some(false),
+                initially_deferred: Some(false),
+                enabled: Some(row.get::<bool, _>(9).unwrap_or(true)),
+                valid: Some(row.get::<bool, _>(10).unwrap_or(true)),
             }
         })
         .collect())
