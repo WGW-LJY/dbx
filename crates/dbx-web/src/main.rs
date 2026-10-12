@@ -570,6 +570,7 @@ async fn serve() -> Result<(), String> {
         transfer_progress_channels: RwLock::new(HashMap::new()),
         table_import_channels: RwLock::new(HashMap::new()),
         sql_file_executions: RwLock::new(HashMap::new()),
+        sql_file_failure_logs: Default::default(),
         managed_sql_previews: Default::default(),
         nacos_imports: RwLock::new(HashMap::new()),
         login_rate_limit: tokio::sync::Mutex::new(state::LoginRateLimit { fail_count: 0, locked_until: None }),
@@ -823,6 +824,8 @@ async fn serve() -> Result<(), String> {
         .route("/query/build-create-user-sql", post(routes::query::build_create_user_sql))
         .route("/query/build-table-select-sql", post(routes::query::build_table_select_sql))
         .route("/query/build-database-search-sql", post(routes::query::build_database_search_sql))
+        .route("/query/build-database-structure-search-sql", post(routes::query::build_database_structure_search_sql))
+        .route("/query/supports-database-structure-search", post(routes::query::supports_database_structure_search))
         .route("/query/build-search-result-where", post(routes::query::build_search_result_where))
         .route("/query/build-rename-object-sql", post(routes::query::build_rename_object_sql))
         .route("/query/build-rename-database-sql", post(routes::query::build_rename_database_sql))
@@ -913,6 +916,11 @@ async fn serve() -> Result<(), String> {
         .route("/query/cancel", post(routes::query::cancel_query))
         .route("/query/cancel-conditional-update", post(routes::query::cancel_conditional_update))
         .route("/query/close-session", post(routes::query::close_query_session))
+        .route("/query/large-value/chunk", post(routes::query::read_large_value_chunk))
+        .route("/query/large-value/release", post(routes::query::release_large_value))
+        .route("/query/large-value/download", post(routes::query::prepare_large_value_download))
+        .route("/query/large-value/export", post(routes::query::prepare_snapshot_export))
+        .route("/query/large-value/download/{id}", get(routes::query::download_large_value))
         .route("/query/close-client-session", post(routes::query::close_client_connection_session))
         .route("/export/query-result-json", post(routes::text_export::export_query_result_json))
         .route("/export/query-result-markdown", post(routes::text_export::export_query_result_markdown))
@@ -1362,6 +1370,9 @@ async fn serve() -> Result<(), String> {
         .route("/sql-file/tables", post(routes::sql_file::inspect_sql_file_tables))
         .route("/sql-file/progress/{executionId}", get(routes::sql_file::sql_file_progress))
         .route("/sql-file/cancel", post(routes::sql_file::cancel_sql_file))
+        .route("/sql-file/failure-log/text", post(routes::sql_file::sql_file_failure_log_text))
+        .route("/sql-file/failure-log/{executionId}", get(routes::sql_file::sql_file_failure_log_download))
+        .route("/sql-file/failure-log/{executionId}/info", get(routes::sql_file::sql_file_failure_log_info))
         // Table import
         .route(
             "/import/preview",

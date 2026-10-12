@@ -24,6 +24,7 @@ import { binaryCellClipboardText } from "@/lib/dataGrid/binaryCellDownload";
 import { formatError } from "@/lib/backend/errorUtils";
 import { parseJsonPreservingLargeNumbers, stringifyJsonPreservingLargeNumbers } from "@/lib/common/safeJsonFormat";
 import { tableMetaWithoutOptionalDatabaseQualifier } from "@/lib/table/tableSelectSql";
+import { isPartiallyLoadedCopy, partialLoadCopyHintKey, type PartialLoadCopyInfo } from "@/lib/dataGrid/copyPartialLoadHint";
 import type { DatabaseType } from "@/types/database";
 
 interface ExtractorRowItem {
@@ -56,6 +57,7 @@ interface UseDataGridExtractorOptions {
   allSourceColumns: ComputedRef<Array<string | undefined> | undefined>;
   visibleColumnIndexes: ComputedRef<number[]>;
   columnTypes: ComputedRef<Array<string | undefined> | undefined>;
+  allColumnTypes?: ComputedRef<Array<string | undefined> | undefined>;
   extractorOptions?: ComputedRef<DataGridExtractorOptions>;
   databaseType: ComputedRef<DatabaseType | undefined>;
   identifierQuote?: ComputedRef<string | undefined>;
@@ -73,6 +75,8 @@ interface UseDataGridExtractorOptions {
   contextSelectionIsSynthetic: ComputedRef<boolean> | Ref<boolean>;
   copyText: (text: string, gridCopy?: { rows: readonly (readonly unknown[])[]; header?: readonly unknown[] }) => Promise<boolean>;
   externalCellValue?: (value: unknown, columnIndex: number) => unknown;
+  /** Present when the grid cannot guarantee the whole result set is loaded; drives the partial-copy hint. */
+  partialLoadInfo?: ComputedRef<PartialLoadCopyInfo | null>;
   canCopySqlInsert: (request: DataGridExtractRequest) => boolean;
   buildMongoInsert: (extractorOptions: DataGridExtractorOptions, rowLimit?: number) => Promise<string | undefined>;
   buildMongoUpdate?: (request: DataGridExtractRequest, rowLimit?: number) => Promise<string | undefined>;
@@ -214,6 +218,7 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
     }
     const compactIndexBySource = new Map(requiredSourceIndexes.map((sourceIndex, compactIndex) => [sourceIndex, compactIndex]));
     const columnTypesBySource = new Map(visibleIndexes.map((sourceIndex, visibleIndex) => [sourceIndex, options.columnTypes.value?.[visibleIndex]]));
+    const columnType = (sourceIndex: number) => options.allColumnTypes?.value?.[sourceIndex] ?? columnTypesBySource.get(sourceIndex);
     const columns = requiredSourceIndexes.map((sourceIndex, compactIndex) => ({
       displayName: fullColumns[sourceIndex],
       // Query results without source metadata still expose their database column
@@ -221,10 +226,11 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
       // availability check so SQL SELECT can use that safe fallback.
       sourceName: sourceNames?.[sourceIndex] ?? fullColumns[sourceIndex],
       sourceIndex: compactIndex,
+      dataType: columnType(sourceIndex),
     }));
     const descriptor = DATA_GRID_COPY_EXTRACTOR_DESCRIPTORS[extractor];
     const selectedColumnIndexes = selectedSourceIndexes.map((sourceIndex) => compactIndexBySource.get(sourceIndex)).filter((index): index is number => index !== undefined);
-    const columnTypes = requiredSourceIndexes.map((sourceIndex) => columnTypesBySource.get(sourceIndex));
+    const columnTypes = requiredSourceIndexes.map(columnType);
     const normalizeValues = descriptor.category === "json" || descriptor.category === "sql";
     const keepUnsafeJsonText = descriptor.category === "sql";
     const presentBinaryText = descriptor.category !== "sql";
@@ -433,6 +439,10 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
       const copied = await options.copyText(result.text, gridCopy);
       if (!copied) return false;
       showWarnings(result.warnings, result.omittedColumns);
+      const partialLoadInfo = options.partialLoadInfo?.value;
+      if (partialLoadInfo && isPartiallyLoadedCopy(partialLoadInfo)) {
+        toast(t(partialLoadCopyHintKey(partialLoadInfo), { loaded: partialLoadInfo.loadedRows, total: partialLoadInfo.totalRows ?? undefined }), 5000);
+      }
       return true;
     } catch (error: unknown) {
       toast(t("grid.copyFailed", { message: formatError(error) }), 5000);

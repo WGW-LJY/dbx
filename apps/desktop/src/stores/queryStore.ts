@@ -1,5 +1,6 @@
 import { hasShortDataGridSqlPage } from "@/lib/dataGrid/dataGridPagination";
 import { createQueryRequestTiming } from "@/lib/queryRequestTiming";
+import { mergeQueryMessages, queryResultMessages } from "@/lib/query/queryResultMessages";
 import { appendNeo4jNodeCells, extractNeo4jNodeCells } from "@/lib/neo4j/neo4jNodeResult";
 import { UPDATE_RESTORE_KEY, assertUpdateAllowsInteraction } from "@/lib/app/updatePreparation";
 import { defineStore } from "pinia";
@@ -40,6 +41,8 @@ import {
   analyzeEditableQueryEditability,
   analyzeSelectStructureForDisplay,
   foldUnquotedPostgresMetadataIdentifier,
+  hasTopLevelKeyword,
+  hasUnparsedQuerySource,
   resolveMetadataColumnName,
   resolveSourceColumnsByOrdinal,
   sourceColumnsForResult,
@@ -107,14 +110,14 @@ import { replaceSqlServerLeadingUseQuery, sqlServerLeadingUseScript, switchesDat
 import { classifySqlRisk } from "@/lib/sql/sqlRisk";
 import { externalSqlFileDisplayTitles, normalizeExternalSqlPath } from "@/lib/sql/sqlFileOpen";
 import { clearDataGridPendingSnapshot, clearDataGridPendingSnapshotsForTab } from "@/composables/useDataGridEditor";
-import { combineDataGridOrderByInputs } from "@/composables/useDataGridSortBuilder";
+import { combineDataGridOrderByInputs, copyDataGridSortBuilderStatesForTab } from "@/composables/useDataGridSortBuilder";
 import { beginClosingDataGridViewSnapshotsForTab, clearDataGridViewSnapshot, clearDataGridViewSnapshotsForTab } from "@/lib/dataGrid/dataGridViewStateCache";
 import { beginClosingBrowserState } from "@/lib/tabs/documentBrowserStateCache";
-import { clearDataGridStructuredFilterStatesForTab } from "@/lib/dataGrid/dataGridFilterBuilderPersistence";
+import { clearDataGridStructuredFilterStatesForTab, copyDataGridStructuredFilterStatesForTab } from "@/lib/dataGrid/dataGridFilterBuilderPersistence";
 import { clearDataGridSearchStatesForTab } from "@/lib/dataGrid/dataGridSearchStatePersistence";
 import { buildTabResultSnapshot, deleteTabResultSnapshot, pruneTabResultSnapshots, readTabResultSnapshot, tabResultCacheKey, writeTabResultSnapshot } from "@/lib/tabs/tabResultCache";
 import { estimateQueryResultsBytes, selectInactiveResultEvictions } from "@/lib/tabs/queryResultSize";
-import { queryResultBaseSql, queryResultExecutionSql, resultGridInstanceKey, syncTabTitleNumbers, tabDisplayTitle } from "@/lib/tabs/tabPresentation";
+import { queryResultBaseSql, queryResultExecutionSql, resultGridInstanceKey, syncTabTitleNumbers, TAB_TITLE_SUFFIX_MAX_LENGTH, tabDisplayTitle } from "@/lib/tabs/tabPresentation";
 import { isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
 import { batchSqlRecoverySql, batchSqlRecoveryState, mergeBatchQueryResults, offsetBatchQueryResultIndexes, prepareBatchSqlRecovery, type BatchSqlRecoveryAction } from "@/lib/query/batchSqlRecovery";
 import { decodeQueryResultArchive, encodeQueryResultArchive, type DecodedQueryResultArchive } from "@/lib/query/queryResultArchive";
@@ -299,6 +302,12 @@ function tabClientSessionId(tab: Pick<QueryTab, "id">, suffix?: (typeof BACKGROU
   return suffix ? `${tab.id}:${suffix}` : tab.id;
 }
 
+// The export session is a separate connection, so it only sees committed data.
+// An open manual transaction is passed along for the backend to read through.
+function exportTxnSessionId(tab: Pick<QueryTab, "autoCommit" | "txnSessionId">): string | undefined {
+  return tab.autoCommit === false ? tab.txnSessionId : undefined;
+}
+
 function resultRunCacheKey(tabId: string, runId: string): string {
   return `tab:${tabId}:run:${runId}`;
 }
@@ -375,6 +384,10 @@ export function appendQueryResultSegment(previous: QueryResult, segment: QueryRe
     spatial_columns: spatial_columns.length > 0 ? spatial_columns : undefined,
     spatial_values: appendParallelValues(previous.spatial_values, segment.spatial_values),
     large_value_cells: appendLargeValueCells(previous.large_value_cells, segment.large_value_cells, previous.rows.length, appendedRowCount),
+    large_value_context: segment.large_value_context ?? previous.large_value_context,
+    large_value_refs: [
+      ...new Set([...(previous.large_value_refs ?? []), ...(segment.large_value_refs ?? []), ...(previous.large_value_cells ?? []).flatMap((cell) => (cell.value_ref ? [cell.value_ref] : [])), ...(segment.large_value_cells ?? []).flatMap((cell) => (cell.value_ref ? [cell.value_ref] : []))]),
+    ],
     mongo_documents: appendParallelValues(previous.mongo_documents, segment.mongo_documents),
     mongo_copy_documents: appendParallelValues(previous.mongo_copy_documents, segment.mongo_copy_documents),
     execution_time_ms: (previous.execution_time_ms ?? 0) + (segment.execution_time_ms ?? 0),
@@ -847,7 +860,7 @@ function projectsAllColumnsForSource(analysis: EditableQueryInfo, sourceKey: str
 }
 
 function queryProjectsDeferredLob(databaseType: DatabaseType, analysis: EditableQueryInfo, sourceKey: string, columns: readonly { name: string; data_type: string }[]): boolean {
-  const deferredTypes = databaseType === "oracle" ? ORACLE_DEFERRED_LOB_TYPES : databaseType === "db2" ? DB2_DEFERRED_LOB_TYPES : undefined;
+  const deferredTypes = databaseType === "oracle" || databaseType === "oceanbase-oracle" ? ORACLE_DEFERRED_LOB_TYPES : databaseType === "db2" ? DB2_DEFERRED_LOB_TYPES : undefined;
   if (!deferredTypes) return false;
   const deferredColumns = new Set(
     columns
@@ -940,7 +953,7 @@ function expandStarProjectionColumnsForSource(analysis: EditableQueryInfo, sourc
       if (column.sourceKey && column.sourceKey !== source.key) return [column];
       return tableColumns.map((tableColumn) => ({
         sourceName: tableColumn.name,
-        sourceNameQuoted: false,
+        sourceNameQuoted: true,
         ...(column.sourceQualifier ? { sourceQualifier: column.sourceQualifier } : {}),
         sourceKey: source.key,
         resultName: tableColumn.name,
@@ -1090,7 +1103,7 @@ export const useQueryStore = defineStore("query", () => {
   // 里而不是渲染函数里，是为了避免在 computed 求值过程中写标签状态；getter 只读
   // 参与标题计算的字段（id + 显示标题），分配编号本身不会再次触发它。
   watch(
-    () => tabs.value.map((tab) => `${tab.id}\u0000${tabDisplayTitle(tab, t)}`),
+    () => tabs.value.map((tab) => `${tab.id}\u0000${tabDisplayTitle(tab, t)}\u0000${tab.titleSuffix ?? ""}`),
     () => syncTabTitleNumbers(tabs.value, t),
     { immediate: true, flush: "sync" },
   );
@@ -1762,6 +1775,7 @@ export const useQueryStore = defineStore("query", () => {
   }
 
   function clearResultPayload(tab: QueryTab, options: { evicted?: boolean; preserveCacheSnapshot?: boolean } = {}) {
+    if (!tab.isExecuting) tab.liveQueryMessages = undefined;
     tab.result = undefined;
     tab.results = undefined;
     tab.activeResultIndex = undefined;
@@ -2062,6 +2076,7 @@ export const useQueryStore = defineStore("query", () => {
     if (!tab || !tab.resultRuns || runIndex < 0) return false;
 
     const removedRun = tab.resultRuns[runIndex];
+    if (removedRun) void releaseResultLargeValues(removedRun.result, ...(removedRun.results ?? []));
     if (removedRun?.resultSessionId) void closeResultRunSession(tab, removedRun);
     if (removedRun?.resultCacheKey) void deleteTabResultSnapshot(removedRun.resultCacheKey);
     if (removedRun) clearResultRunPayload(removedRun);
@@ -2091,9 +2106,10 @@ export const useQueryStore = defineStore("query", () => {
     if (!tab.result && !tab.results?.length && !tab.resultEvicted) return false;
 
     const closeSession = closeResultSession(tab);
+    const releaseValues = releaseResultLargeValues(tab.result, ...(tab.results ?? []));
     releaseTabResultObjectPayloads(tab);
     clearResultPayload(tab);
-    await closeSession;
+    await Promise.all([closeSession, releaseValues]);
     return true;
   }
 
@@ -2108,8 +2124,10 @@ export const useQueryStore = defineStore("query", () => {
     const currentSessionId = tab.resultSessionId ?? tab.result?.session_id;
     if (currentSessionId) closedSessionIds.add(currentSessionId);
     const closeOperations = [closeResultSession(tab)];
+    closeOperations.push(releaseResultLargeValues(tab.result, ...(tab.results ?? [])));
 
     for (const run of resultRuns) {
+      closeOperations.push(releaseResultLargeValues(run.result, ...(run.results ?? [])));
       if (run.resultCacheKey) void deleteTabResultSnapshot(run.resultCacheKey);
       if (!run.resultSessionId || closedSessionIds.has(run.resultSessionId)) continue;
       closedSessionIds.add(run.resultSessionId);
@@ -2125,6 +2143,34 @@ export const useQueryStore = defineStore("query", () => {
 
   function nextResultRunSequence(tab: QueryTab): number {
     return (tab.resultRuns?.reduce((max, run) => Math.max(max, run.sequence), 0) ?? 0) + 1;
+  }
+
+  function resultLargeValueKey(result: QueryResult, valueRef: string): string {
+    const context = result.large_value_context;
+    return JSON.stringify([context?.connectionId, context?.database, context?.clientSessionId, context?.txnSessionId, context?.catalog, valueRef]);
+  }
+
+  function resultLargeValueKeys(result?: QueryResult): string[] {
+    if (!result?.large_value_context) return [];
+    return [...(result.large_value_refs ?? []), ...(result.large_value_cells ?? []).flatMap((cell) => (cell.value_ref ? [cell.value_ref] : []))].map((ref) => resultLargeValueKey(result, ref));
+  }
+
+  async function releaseResultLargeValues(...results: Array<QueryResult | undefined>) {
+    const released = new Set<string>();
+    for (const result of results) {
+      const context = result?.large_value_context;
+      if (!context) continue;
+      const refs = new Set([...(result.large_value_refs ?? []), ...(result.large_value_cells ?? []).flatMap((cell) => (cell.value_ref ? [cell.value_ref] : []))]);
+      for (const valueRef of refs) {
+        if (released.has(valueRef)) continue;
+        released.add(valueRef);
+        try {
+          await api.releaseLargeValue({ ...context, valueRef });
+        } catch (error) {
+          console.warn("[DBX][large-value:release:error]", error);
+        }
+      }
+    }
   }
 
   async function closeResultRunSession(tab: QueryTab, run: NonNullable<QueryTab["resultRuns"]>[number]) {
@@ -2329,6 +2375,7 @@ export const useQueryStore = defineStore("query", () => {
     if (!tab.activeResultRunId || !tab.resultRuns?.length) return;
     const index = tab.resultRuns.findIndex((run) => run.id === tab.activeResultRunId);
     if (index < 0) return;
+    const previousRun = tab.resultRuns[index];
     const run = {
       ...tab.resultRuns[index],
       ...(sql ? { sql } : {}),
@@ -2376,6 +2423,14 @@ export const useQueryStore = defineStore("query", () => {
     };
     void persistResultRun(tab, run);
     tab.resultRuns[index] = run;
+    const retainedResults = [tab.result, ...(tab.results ?? []), ...tab.resultRuns.flatMap((item) => [item.result, ...(item.results ?? [])])];
+    const retainedRefs = new Set(retainedResults.flatMap((result) => resultLargeValueKeys(result)));
+    const discardedResults = [previousRun.result, ...(previousRun.results ?? [])].map((result) => {
+      if (!result) return undefined;
+      const refs = [...(result.large_value_refs ?? []), ...(result.large_value_cells ?? []).flatMap((cell) => (cell.value_ref ? [cell.value_ref] : []))];
+      return { ...result, large_value_cells: [], large_value_refs: refs.filter((valueRef) => !retainedRefs.has(resultLargeValueKey(result, valueRef))) };
+    });
+    void releaseResultLargeValues(...discardedResults);
   }
 
   function syncDisplayedResultRun(tab: QueryTab, sql: string, captureNewRun = false, options: ResultRunCaptureOptions = {}) {
@@ -2612,6 +2667,7 @@ export const useQueryStore = defineStore("query", () => {
     tabs.value.map((t) => ({
       id: t.id,
       title: t.title,
+      titleSuffix: t.titleSuffix,
       connectionId: t.connectionId,
       database: t.database,
       schema: t.schema,
@@ -3184,6 +3240,7 @@ export const useQueryStore = defineStore("query", () => {
       const { ddl } = await loadObjectDdl(
         {
           connectionId,
+          queryTimeoutSecs: connectionStore.getConfig(connectionId)?.query_timeout_secs,
           database,
           schema: ddlViewer.schema || database,
           tableName: ddlViewer.tableName,
@@ -4816,6 +4873,12 @@ export const useQueryStore = defineStore("query", () => {
       previewSql: original.previewSql,
     };
     initializeResultAutoSave(newTab);
+    if (newTab.mode === "data") {
+      // Seed builder state before the new grid mounts; the combined WHERE alone
+      // cannot recover which conditions belong to the manual input or quick UI.
+      copyDataGridStructuredFilterStatesForTab(id, newId);
+      copyDataGridSortBuilderStatesForTab(id, newId);
+    }
     tabs.value.splice(idx + 1, 0, newTab);
 
     const owner = groupForTab(id);
@@ -5564,6 +5627,19 @@ export const useQueryStore = defineStore("query", () => {
     return true;
   }
 
+  /**
+   * Sets (or clears, with an empty string) the user-chosen suffix shown after a
+   * tab's title. The suffix replaces the automatic number for that tab only.
+   */
+  function setTabTitleSuffix(id: string, suffix: string) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab) return false;
+    const trimmed = suffix.trim().slice(0, TAB_TITLE_SUFFIX_MAX_LENGTH);
+    if (trimmed) tab.titleSuffix = trimmed;
+    else delete tab.titleSuffix;
+    return true;
+  }
+
   function linkSavedSql(id: string, savedSqlId: string, title?: string) {
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab) return;
@@ -6157,7 +6233,9 @@ export const useQueryStore = defineStore("query", () => {
   }
 
   function canUseQueryKeylessRowPredicate(databaseType: DatabaseType, loaded: LoadedEditableSource): boolean {
+    if (loaded.tableMeta.columns.some((column) => column.resolved_table) && loaded.tableMeta.tableType?.trim().toUpperCase() !== "TABLE") return false;
     if (!canUseKeylessRowPredicate(databaseType, loaded.tableMeta.primaryKeys)) return false;
+    if (databaseType === "oceanbase-oracle" && loaded.tableMeta.tableType?.trim().toUpperCase() !== "TABLE") return false;
     // An unknown Oracle object may be a view whose query shape rejects ROWID
     // and whose rows cannot be mapped safely for writes. Keep the result
     // read-only until the object tree or tab metadata confirms its type.
@@ -6214,7 +6292,10 @@ export const useQueryStore = defineStore("query", () => {
     // (issue #10567). Fold the SQL-text schema, not a tab-selected one — the
     // object tree already reports the stored spelling.
     const foldedSourceSchema = foldUnquotedPostgresMetadataIdentifier(metadataDbType, source.schema, source.schemaQuoted);
-    const schema = foldedSourceSchema || (dbType === "sqlserver" ? "" : tab.schema) || "";
+    // An OceanBase public synonym is eligible only for an unqualified name.
+    // Keep the selected CURRENT_SCHEMA separate from an explicit SQL owner.
+    const resolveInCurrentOceanbaseSchema = metadataDbType === "oceanbase-oracle" && !source.schema;
+    const schema = foldedSourceSchema || (dbType === "sqlserver" || resolveInCurrentOceanbaseSchema ? "" : tab.schema) || "";
     // Oracle-family connection databases are service names, not schemas. When
     // the query does not qualify a schema, let the driver resolve the current
     // login user's schema instead of looking up metadata under the service name.
@@ -6246,7 +6327,7 @@ export const useQueryStore = defineStore("query", () => {
     // Keep SQL Server writes unqualified unless the SELECT source explicitly
     // named a schema, so SELECT and UPDATE resolve the same object.
     const writeSchema = dbType === "sqlserver" && !source.schema ? undefined : metadataSchema || undefined;
-    const localTableType = oracleCompletionTableType(tab, metadataDbType, metadataDatabase, metadataSchema || conn?.default_schema || "", metadataTableName, metadataCatalog);
+    const localTableType = oracleCompletionTableType(tab, metadataDbType, metadataDatabase, metadataSchema || (resolveInCurrentOceanbaseSchema ? tab.schema : undefined) || conn?.default_schema || "", metadataTableName, metadataCatalog);
     const knownTableType = localTableType ?? (tab.tableMeta?.tableName.toLowerCase() === metadataTableName.toLowerCase() && normalizeOptionalSchema(tab.tableMeta.schema) === normalizeOptionalSchema(metadataSchema) ? tab.tableMeta.tableType : undefined);
     return {
       source: metadataSource,
@@ -6256,6 +6337,7 @@ export const useQueryStore = defineStore("query", () => {
         connectionId: tab.connectionId!,
         database: metadataDatabase,
         schema: metadataSchema,
+        ...(resolveInCurrentOceanbaseSchema && tab.schema ? { currentSchema: tab.schema } : {}),
         tableName: metadataTableName,
         tableType: knownTableType,
         databaseType: dbType,
@@ -6267,7 +6349,8 @@ export const useQueryStore = defineStore("query", () => {
 
   function loadedEditableSourceFromMetadata(target: EditableSourceMetadataTarget, metadata: Awaited<ReturnType<typeof loadTableMetadata>>["metadata"]): LoadedEditableSource {
     const usesReportedSchema = target.request.databaseType === "vastbase" || target.request.databaseType === "kingbase";
-    const writeSchema = usesReportedSchema && !target.writeSchema ? metadata.schema : target.writeSchema;
+    const resolvedTarget = metadata.columns.find((column) => column.resolved_table);
+    const writeSchema = resolvedTarget?.resolved_schema ?? (usesReportedSchema && !target.writeSchema ? metadata.schema : target.writeSchema || target.request.currentSchema);
     return {
       source: target.source,
       analysis: target.analysis,
@@ -6275,7 +6358,7 @@ export const useQueryStore = defineStore("query", () => {
         catalog: target.request.catalog,
         database: target.request.database,
         schema: writeSchema,
-        tableName: target.request.tableName,
+        tableName: resolvedTarget?.resolved_table ?? target.request.tableName,
         tableType: metadata.tableType,
         columns: metadata.columns,
         primaryKeys: metadata.primaryKeys,
@@ -6394,9 +6477,15 @@ export const useQueryStore = defineStore("query", () => {
 
   function buildHiddenPrimaryKeyPreparation(tab: QueryTab, sql: string, databaseType: DatabaseType, loaded: LoadedEditableSource, primaryKeys: string[], declaredPrimaryKeys: string[], traceId: string, elapsed: () => string): EditableQueryExecutionPreparation {
     const metadataAnalysis = expandStarProjectionColumnsForSource(bindColumnsForSource(databaseType, loaded.analysis, loaded.source, loaded.tableMeta.columns), loaded.source, loaded.tableMeta.columns);
-    const stableLobSource = databaseType === "oracle" ? oracleRowIdIsSafeForQuery(tab, loaded) : databaseType === "db2";
-    const largeValuePreview = (databaseType === "oracle" || databaseType === "db2") && primaryKeys.length > 0 && stableLobSource && columnsAllowDeferredLobMarkers(loaded.tableMeta.columns) && queryProjectsDeferredLob(databaseType, metadataAnalysis, loaded.source.key, loaded.tableMeta.columns);
+    const stableLobSource = databaseType === "oracle" || databaseType === "oceanbase-oracle" ? oracleRowIdIsSafeForQuery(tab, loaded) : databaseType === "db2";
+    const largeValuePreview =
+      (databaseType === "oracle" || databaseType === "oceanbase-oracle" || databaseType === "db2") &&
+      primaryKeys.length > 0 &&
+      stableLobSource &&
+      columnsAllowDeferredLobMarkers(loaded.tableMeta.columns) &&
+      queryProjectsDeferredLob(databaseType, metadataAnalysis, loaded.source.key, loaded.tableMeta.columns);
     const unchanged = { sql, metadataSql: sql, hiddenPrimaryKeys: [], largeValuePreview };
+    if (hasTopLevelKeyword(sql, ["GROUP", "HAVING"], databaseType)) return unchanged;
     const missingPrimaryKeys =
       declaredPrimaryKeys.length === 0
         ? primaryKeys.filter(
@@ -6430,19 +6519,21 @@ export const useQueryStore = defineStore("query", () => {
     if (!databaseType || !HIDDEN_QUERY_KEY_DATABASE_TYPES.has(databaseType) || !tab.connectionId) return unchanged;
 
     try {
+      if (hasTopLevelKeyword(sql, ["GROUP", "HAVING"], databaseType)) return unchanged;
       const editability = analyzeEditableQueryEditability(sql);
       if (!editability.editable || !editability.analysis) return unchanged;
       const analysis = editability.analysis;
+      if (analysis.groupByColumns?.length || analysis.hasHavingClause) return unchanged;
       const sources = editableQuerySources(analysis);
       if (sources.length !== 1 || analysis.distinct) return unchanged;
       const source = sources[0]!;
       const wholeSourceProjected = projectsAllColumnsForSource(analysis, source.key);
       const hasDirectSourceProjection = analysis.columns.some((column) => Boolean(column.sourceName) && (!column.sourceKey || column.sourceKey === source.key));
       if (!wholeSourceProjected && !hasDirectSourceProjection) return unchanged;
-      // Whole-source projections already include declared primary keys. Oracle
+      // Whole-source projections already include declared primary keys. Oracle, OceanBase Oracle
       // and Xugu may need a synthetic key, while DB2 needs column metadata to
       // decide whether LOB materialization can be deferred safely.
-      if (databaseType !== "oracle" && databaseType !== "xugu" && databaseType !== "db2" && wholeSourceProjected) return unchanged;
+      if (databaseType !== "oracle" && databaseType !== "oceanbase-oracle" && databaseType !== "xugu" && databaseType !== "db2" && wholeSourceProjected) return unchanged;
 
       const target = resolveEditableSourceMetadataTarget(tab, analysis, source, conn, databaseType, executionDatabase);
       const cached = getCachedTableMetadata(target.request);
@@ -6646,6 +6737,14 @@ export const useQueryStore = defineStore("query", () => {
     }
 
     queryExecutionLog("info", "metadata:editability:start", { traceId, elapsed: elapsed?.() });
+    if (hasUnparsedQuerySource(sql)) {
+      return {
+        queryAnalysis: undefined,
+        querySourceColumns: undefined,
+        queryEditabilityReason: "complex-source",
+        tableMeta: undefined,
+      };
+    }
     const editability = await api.analyzeEditableQueryEditability(sql);
     queryExecutionLog("info", "metadata:editability:done", {
       traceId,
@@ -7107,6 +7206,7 @@ export const useQueryStore = defineStore("query", () => {
     }
     tab.executionId = executionId;
     const tableDataNativeSelectionBlockOwner = tab.mode === "data" ? {} : undefined;
+    tab.liveQueryMessages = [];
     if (tableDataNativeSelectionBlockOwner) beginDataGridNativeSelectionBlock(tableDataNativeSelectionBlockOwner);
     const previousDisplayedSql = tab.resultBaseSql ?? tab.lastExecutedSql ?? tab.sql;
     tab.lastExecutedSql = sql;
@@ -7136,6 +7236,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.resultTotalRowCountLoading = false;
     const previousResultSessionClose = closeResultSession(tab, options?.pagination?.sessionId);
     if (!preserveResultDuringExecution || !tab.result) {
+      if (!captureResultRun) void releaseResultLargeValues(tab.result, ...(tab.results ?? []));
       clearResultPayload(tab, { preserveCacheSnapshot: captureResultRun && pendingResultRunRestores.has(executionId) });
     }
     queryExecutionLog("info", "start", {
@@ -7158,6 +7259,7 @@ export const useQueryStore = defineStore("query", () => {
     let countSql: string | undefined;
     let exactQueryRowBound: number | undefined;
     let useAgentResultSession = false;
+    let unsubscribeQueryMessages: (() => void) | undefined;
     let paginationRowNumberColumn: string | undefined;
     let executionDispatched = false;
     let clientRequestStartedAt: number | undefined;
@@ -7170,6 +7272,14 @@ export const useQueryStore = defineStore("query", () => {
     // the row/column locate flow. These locals live inside the try block.
     let errorLocateContext: { databaseType: DatabaseType | undefined; parameterOptions: SqlParameterOptions | undefined; sourceOffset: number | undefined; executedSql: string | undefined } | undefined;
     try {
+      if (isTauriRuntime()) {
+        unsubscribeQueryMessages = await api.subscribeQueryMessages(executionId, (messages) => {
+          const current = findExecutionTab(id);
+          if (current?.executionId === executionId && current.isExecuting) {
+            current.liveQueryMessages = [...(current.liveQueryMessages ?? []), ...messages].slice(0, 1001);
+          }
+        });
+      }
       await waitForTabSessionReset(id);
       const connStore = useConnectionStore();
       const executionTarget = resumedExecutionTarget ?? options?.executionTarget;
@@ -7986,6 +8096,10 @@ export const useQueryStore = defineStore("query", () => {
       // would return the first page again (#8993).
       const isOffsetJumpPage = typeof pageOffset === "number" && pageOffset > 0 && !options?.pagination?.sessionId;
       const frontendTimeoutSecs = frontendQueryTimeoutSecsForSql(sqlToExecute, effectiveDbType, queryTimeoutSecs, sqlStatementParameterOptions);
+      if (tab.mode === "data" && effectiveDbType === "oceanbase-oracle") {
+        const meta = tableMetaForDataTab(tab);
+        useLargeValuePreview = !!meta && /^(?:BASE )?TABLE$/i.test(meta.tableType ?? "") && columnsAllowDeferredLobMarkers(meta.columns) && meta.columns.some((column) => /^(N?CLOB|BLOB)$/i.test(column.data_type.trim()));
+      }
       const sourceLabelDatabase = targetDatabase || conn?.database;
       const executionClientSessionId = options?.pagination?.clientSessionId ?? (tab.mode === "query" || tab.mode === "data" ? tabClientSessionId(tab) : undefined);
       const currentBeforeDispatch = findExecutionTab(id);
@@ -8201,6 +8315,28 @@ export const useQueryStore = defineStore("query", () => {
       const responseResults = await withFrontendQueryTimeout(executionPromise, frontendTimeoutSecs, t("editor.queryTimeoutError", { seconds: frontendTimeoutSecs }), () => {
         void api.cancelQuery(executionId).catch((error) => queryExecutionLog("warn", "frontend-timeout:cancel-failed", { traceId, error }));
       });
+      for (const result of responseResults) {
+        if (effectiveDbType === "oceanbase-oracle" && !useLargeValuePreview && result.column_types?.some((type) => /^(N?CLOB|BLOB)$/i.test(type.trim()))) {
+          result.messages = [
+            ...(result.messages ?? []),
+            {
+              severity: "INFO",
+              code: "LOB_COMPLETE_READ_FALLBACK",
+              message: "LOB values were read completely because this result does not have a verified single-table preview source.",
+            },
+          ];
+        }
+        if (result.large_value_cells?.some((cell) => cell.value_ref)) {
+          result.large_value_refs = result.large_value_cells.flatMap((cell) => (cell.value_ref ? [cell.value_ref] : []));
+          result.large_value_context = {
+            connectionId: executionConnectionId,
+            database: executionDatabase,
+            clientSessionId: executionClientSessionId,
+            txnSessionId: tab.autoCommit === false ? tab.txnSessionId : undefined,
+            catalog: executionCatalog,
+          };
+        }
+      }
       if (findExecutionTab(id) !== tab || tab.executionId !== executionId || manualTransactionTargetEpoch(tab) !== executionTargetEpoch) return false;
       // A single result has an unambiguous request boundary. This includes fetch and
       // transport, but excludes SQL preparation and the grid's later render work.
@@ -8554,9 +8690,18 @@ export const useQueryStore = defineStore("query", () => {
         syncDisplayedResultRun(current, queryBaseSql, captureResultRun);
       }
     } finally {
+      unsubscribeQueryMessages?.();
       if (tableDataNativeSelectionBlockOwner) finishDataGridNativeSelectionBlock(tableDataNativeSelectionBlockOwner);
       const current = findExecutionTab(id);
       if (current?.executionId === executionId) {
+        if (producedResult && current.result && current.liveQueryMessages?.length) {
+          const results = current.results?.length ? current.results : [current.result];
+          const completed = results.flatMap(queryResultMessages);
+          const missing = mergeQueryMessages(completed, current.liveQueryMessages).slice(completed.length);
+          current.result.messages = [...queryResultMessages(current.result), ...missing];
+          current.liveQueryMessages = undefined;
+        }
+        if (!current.liveQueryMessages?.length) current.liveQueryMessages = undefined;
         const liveBatch = liveBatchSqlExecutions.get(current);
         if (liveBatch?.executionId === executionId) current.batchSqlExecution = liveBatch;
         finishBatchSqlExecution(current, executionId, current.isCancelling === true);
@@ -9833,6 +9978,7 @@ export const useQueryStore = defineStore("query", () => {
       keysetOptimizationEnabled: settings.queryExportKeysetOptimizationEnabled,
       csvQuoteMode: settings.csvQuoteMode,
       clientSessionId,
+      txnSessionId: exportTxnSessionId(tab),
       nullLiteral: csvNullLiteralForMode(settings.csvNullMode),
       executionId: uuid(),
       exportTableName: options.format === "sql" && hasUniqueInsertTarget ? options.exportTableName : undefined,
@@ -9875,6 +10021,7 @@ export const useQueryStore = defineStore("query", () => {
       keysetOptimizationEnabled: settings.queryExportKeysetOptimizationEnabled,
       csvQuoteMode: settings.csvQuoteMode,
       clientSessionId: `${tabClientSessionId(tab, "export")}:${exportId}`,
+      txnSessionId: exportTxnSessionId(tab),
       nullLiteral: csvNullLiteralForMode(settings.csvNullMode),
       executionId: uuid(),
       numericColumnRightAlign: settings.numericColumnRightAlign,
@@ -10006,6 +10153,7 @@ export const useQueryStore = defineStore("query", () => {
     rollbackTransaction,
     ensureManualTransactionSession,
     renameTab,
+    setTabTitleSuffix,
     openDatabaseBrowser,
     openDatabaseSearch,
     openDriverProfileWorkspace,
