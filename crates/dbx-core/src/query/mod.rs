@@ -861,6 +861,22 @@ async fn connection_database_type(state: &AppState, connection_id: &str) -> Opti
     configs.get(connection_id).map(|config| config.db_type)
 }
 
+async fn connection_statement_split_database_type(state: &AppState, connection_id: &str) -> Option<DatabaseType> {
+    let configs = state.configs.read().await;
+    configs.get(connection_id).map(statement_split_database_type)
+}
+
+/// A generic JDBC connection to Oracle runs PL/SQL through the JDBC plugin, so its
+/// script is split with the Oracle rules. The plain `Jdbc` profile would cut every
+/// routine body at its first inner semicolon and replace the object with the fragment.
+fn statement_split_database_type(config: &ConnectionConfig) -> DatabaseType {
+    if crate::schema::is_oracle_external_driver_config(config) {
+        DatabaseType::Oracle
+    } else {
+        config.db_type
+    }
+}
+
 async fn connection_sql_compatibility_mode(
     state: &AppState,
     pool_key: &str,
@@ -3559,8 +3575,9 @@ async fn execute_multi_core_with_options_for_client_and_progress_typed_inner(
     let compatibility_mode = connection_sql_compatibility_mode(state, &pool_key, db_type).await;
     let complete_sqlserver_agent_batch =
         is_sqlserver_agent && sqlserver_agent_batch::requires_complete_results(sql, &options);
+    let split_db_type = connection_statement_split_database_type(state, connection_id).await;
     let execution_plan =
-        query_execution_plan_with_compatibility(sql, db_type, is_sqlserver_agent, compatibility_mode.as_deref());
+        query_execution_plan_with_compatibility(sql, split_db_type, is_sqlserver_agent, compatibility_mode.as_deref());
     let continue_on_error = options.continue_on_error && !execution_plan.stop_on_error;
     let statements = execution_plan.statements;
     if statements.is_empty() {
@@ -6063,11 +6080,14 @@ fn mysql_error_is_syntax_error(error: &mysql_async::Error) -> bool {
 }
 
 /// Compute per-execution-statement proven-read-only markers for the sticky
-/// manual-transaction UX (#7122 Oracle, #9018 MySQL/PostgreSQL). The user-facing
-/// classification SQL is split with the same dialect-aware splitter as the
-/// execution SQL and paired by count/position; any mismatch is fail-closed (no
-/// markers). Oracle/OceanBase-Oracle keep the lexical classifier, MySQL and
-/// PostgreSQL use the strict `sql_risk` proof; every other dialect is unproven.
+/// manual-transaction UX (#7122 Oracle, #9018 MySQL/PostgreSQL, ... GaussDB).
+/// The user-facing classification SQL is split with the same dialect-aware
+/// splitter as the execution SQL and paired by count/position; any mismatch is
+/// fail-closed (no markers). Oracle/OceanBase-Oracle reach the same AST proof as
+/// the PostgreSQL family through `is_oracle_proven_read_only_statement`, which
+/// keeps the Oracle-specific lexical guard rails (see `sql_risk`); MySQL and the
+/// PostgreSQL family use the strict `sql_risk` proof directly; every other
+/// dialect is unproven.
 fn classify_manual_transaction_statements(
     database_type: Option<DatabaseType>,
     execution_statement_count: usize,
@@ -6076,7 +6096,12 @@ fn classify_manual_transaction_statements(
     let Some(database_type) = database_type.filter(|database_type| {
         matches!(
             database_type,
-            DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Mysql | DatabaseType::Postgres
+            DatabaseType::Oracle
+                | DatabaseType::OceanbaseOracle
+                | DatabaseType::Mysql
+                | DatabaseType::Postgres
+                | DatabaseType::Gaussdb
+                | DatabaseType::OpenGauss
         )
     }) else {
         return Vec::new();
@@ -6092,7 +6117,7 @@ fn classify_manual_transaction_statements(
     user_statements
         .iter()
         .map(|statement| match database_type {
-            DatabaseType::Mysql | DatabaseType::Postgres => {
+            DatabaseType::Mysql | DatabaseType::Postgres | DatabaseType::Gaussdb | DatabaseType::OpenGauss => {
                 crate::sql_risk::prove_read_only_for_database(statement, database_type)
                     == crate::sql_risk::ReadProof::ProvenReadOnly
             }
@@ -6447,7 +6472,14 @@ pub async fn execute_in_manual_transaction_with_options(
         );
         if matches!(
             db_type,
-            Some(DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Mysql | DatabaseType::Postgres)
+            Some(
+                DatabaseType::Oracle
+                    | DatabaseType::OceanbaseOracle
+                    | DatabaseType::Mysql
+                    | DatabaseType::Postgres
+                    | DatabaseType::Gaussdb
+                    | DatabaseType::OpenGauss
+            )
         ) {
             result = result.with_manual_transaction_no_statement();
         }
@@ -8550,6 +8582,7 @@ for line in sys.stdin:
             read_only: false,
             is_production: false,
             production_databases: vec![],
+            production_badge_scope: None,
             database_info: None,
         }
     }
@@ -10363,6 +10396,22 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn jdbc_oracle_execution_plan_keeps_plsql_units_whole() {
+        let mut oracle = test_connection_config(DatabaseType::Jdbc);
+        oracle.connection_string = Some("jdbc:oracle:thin:@//127.0.0.1:1521/FREEPDB1".to_string());
+        let function = "CREATE OR REPLACE EDITIONABLE FUNCTION \"APP\".\"F\" (p VARCHAR2) RETURN VARCHAR2 IS\n\
+                        l_ret VARCHAR2(200);\nBEGIN\n  SELECT p INTO l_ret FROM dual;\n  RETURN l_ret;\nEND;";
+
+        let plan = query_execution_plan(function, Some(statement_split_database_type(&oracle)), false);
+
+        assert_eq!(plan.statements, vec![function]);
+
+        let mut other = test_connection_config(DatabaseType::Jdbc);
+        other.connection_string = Some("jdbc:h2:mem:test".to_string());
+        assert_eq!(statement_split_database_type(&other), DatabaseType::Jdbc);
+    }
+
+    #[test]
     fn ordinary_agent_execution_plan_still_splits_semicolon_statements() {
         let plan = query_execution_plan("SELECT 1; SELECT 2;", Some(DatabaseType::Dameng), false);
 
@@ -11657,6 +11706,7 @@ for line in sys.stdin:
             read_only: false,
             is_production: false,
             production_databases: vec![],
+            production_badge_scope: None,
             database_info: None,
         };
 
@@ -12095,6 +12145,15 @@ for line in sys.stdin:
             classify_manual_transaction_statements(Some(DatabaseType::Postgres), 1, Some("SELECT * FROM users")),
             vec![true]
         );
+        // GaussDB/openGauss share the PostgreSQL-family proof.
+        assert_eq!(
+            classify_manual_transaction_statements(Some(DatabaseType::Gaussdb), 1, Some("SELECT * FROM users")),
+            vec![true]
+        );
+        assert_eq!(
+            classify_manual_transaction_statements(Some(DatabaseType::OpenGauss), 1, Some("UPDATE users SET x = 1")),
+            vec![false]
+        );
         // Mixed script: every statement is classified individually.
         assert_eq!(
             classify_manual_transaction_statements(Some(DatabaseType::Mysql), 2, Some("SELECT 1; DELETE FROM t")),
@@ -12111,10 +12170,25 @@ for line in sys.stdin:
         assert!(classify_manual_transaction_statements(Some(DatabaseType::Mysql), 1, None).is_empty());
         assert!(classify_manual_transaction_statements(Some(DatabaseType::Doris), 1, Some("SELECT 1")).is_empty());
         assert!(classify_manual_transaction_statements(None, 1, Some("SELECT 1")).is_empty());
-        // Oracle keeps its lexical classifier and its pairing behavior.
+        // Oracle/OceanBase-Oracle share the AST proof and keep the pairing
+        // behavior; built-in functions are now provable (#11788) while the
+        // Oracle guard rails (dblink, sequence pseudocolumns, set operators)
+        // still fail the proof.
         assert_eq!(
             classify_manual_transaction_statements(Some(DatabaseType::Oracle), 1, Some("SELECT * FROM EMP")),
             vec![true]
+        );
+        assert_eq!(
+            classify_manual_transaction_statements(Some(DatabaseType::Oracle), 1, Some("SELECT LENGTH(1) FROM dual")),
+            vec![true]
+        );
+        assert_eq!(
+            classify_manual_transaction_statements(
+                Some(DatabaseType::OceanbaseOracle),
+                2,
+                Some("SELECT COUNT(*) FROM EMP; SELECT * FROM EMP@LINK")
+            ),
+            vec![true, false]
         );
         assert_eq!(
             classify_manual_transaction_statements(Some(DatabaseType::OceanbaseOracle), 1, Some("DELETE FROM EMP")),
@@ -12415,6 +12489,103 @@ for line in sys.stdin:
         // Both statements ran on the plain execute path — no cursor session was
         // opened, so nothing leaks a query cursor on the agent.
         assert!(results.iter().all(|result| result.result.session_id.is_none()));
+
+        assert!(rollback_manual_transaction(&state, &txn_session_id).await.is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #11788: the Oracle manual-transaction marker must follow the user's SQL
+    /// through the real execution path — `execute_in_manual_transaction_with_options`
+    /// → statement/classification pairing → per-statement marker — because that
+    /// marker is what the frontend aggregates into `tab.txnPossiblyDirty` and the
+    /// toolbar's Commit/Rollback visibility. The fake agent echoes each statement,
+    /// so this needs no live database. It does NOT cover the Java driver or a real
+    /// Oracle server, and it does not render the toolbar; the two-way real-Oracle
+    /// acceptance run is still outstanding.
+    #[tokio::test]
+    async fn oracle_manual_transaction_marks_only_proven_read_only_statements() {
+        async fn markers(state: &AppState, txn_session_id: &str, sql: &str) -> Vec<bool> {
+            execute_in_manual_transaction_with_options(
+                state,
+                txn_session_id,
+                sql,
+                "ORCL",
+                None,
+                ManualTransactionExecutionOptions { classification_sql: Some(sql.to_string()), ..Default::default() },
+            )
+            .await
+            .expect("statement executes through the manual transaction session")
+            .into_iter()
+            .map(|result| result.manual_transaction_proven_read_only)
+            .collect()
+        }
+
+        let (state, txn_session_id, dir) = manual_transaction_test_state(DatabaseType::Oracle).await;
+
+        // Proven reads: the toolbar must stay clean, including the built-in
+        // functions and non-call parentheses the old blanket `(` rule rejected.
+        for sql in [
+            "SELECT LENGTH(1) FROM dual",
+            "SELECT COUNT(*) FROM EMP",
+            "SELECT UPPER(name) FROM EMP",
+            "SELECT NVL(name, 'x') FROM EMP",
+            "SELECT * FROM EMP WHERE id IN (1, 2, 3)",
+            "SELECT CURRENT_TIME FROM dual",
+        ] {
+            assert_eq!(markers(&state, &txn_session_id, sql).await, vec![true], "expected proven: {sql}");
+        }
+
+        // Unproven statements must still dirty the session.
+        for sql in [
+            "SELECT my_udf(id) FROM EMP",
+            "SELECT DBMS_LOCK.SLEEP(1) FROM dual",
+            "SELECT * FROM EMP@LINK",
+            "SELECT seq.NEXTVAL FROM dual",
+            "SELECT * FROM EMP FOR UPDATE",
+            "UPDATE EMP SET name = 'x'",
+        ] {
+            assert_eq!(markers(&state, &txn_session_id, sql).await, vec![false], "expected unproven: {sql}");
+        }
+
+        // A mixed script is classified per statement and paired by position, so
+        // one unproven statement keeps the session dirty.
+        assert_eq!(
+            markers(&state, &txn_session_id, "SELECT COUNT(*) FROM EMP; SELECT * FROM EMP@LINK").await,
+            vec![true, false]
+        );
+
+        // The marker is the frontend contract: present in JSON only when proven.
+        let proven = execute_in_manual_transaction_with_options(
+            &state,
+            &txn_session_id,
+            "SELECT UPPER(name) FROM EMP",
+            "ORCL",
+            None,
+            ManualTransactionExecutionOptions {
+                classification_sql: Some("SELECT UPPER(name) FROM EMP".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("proven statement executes");
+        assert_eq!(
+            serde_json::to_value(&proven[0]).unwrap()["manual_transaction_proven_read_only"],
+            serde_json::json!(true)
+        );
+        let unproven = execute_in_manual_transaction_with_options(
+            &state,
+            &txn_session_id,
+            "SELECT my_udf(id) FROM EMP",
+            "ORCL",
+            None,
+            ManualTransactionExecutionOptions {
+                classification_sql: Some("SELECT my_udf(id) FROM EMP".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("unproven statement executes");
+        assert!(serde_json::to_value(&unproven[0]).unwrap().get("manual_transaction_proven_read_only").is_none());
 
         assert!(rollback_manual_transaction(&state, &txn_session_id).await.is_ok());
         let _ = std::fs::remove_dir_all(dir);

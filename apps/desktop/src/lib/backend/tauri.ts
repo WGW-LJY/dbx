@@ -1,7 +1,10 @@
+import type { StarRocksAlterOptions } from "@/lib/table/starrocksAlterOptions";
+import type { CreateTableDialectOptions } from "@/lib/table/starrocksPhysicalOptions";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { Channel } from "@tauri-apps/api/core";
 import type { MongoDumpFormat, MongoDumpSourceInput, MongoDumpCatalog, MongoRestoreSourcePreview, MongoDatabaseDumpRequest, MongoDatabaseRestoreRequest, MongoDatabaseDumpProgress } from "./mongodbDumpTypes";
 import type { MongoRestoreUpload, MongoSourceReadOptions } from "./mongodbDumpTypes";
+import type { DamengDumpKind, DamengDumpRequest, DamengDumpProgress } from "./damengDumpTypes";
 import type { UserSkillRootSettings, UserSkillsListResult, UserSkillsReadResult } from "@/types/userSkills";
 import type { DatabaseBackupCommand, DatabaseBackupBackgroundStatus } from "@/lib/backup/backgroundDatabaseBackup";
 
@@ -116,7 +119,7 @@ import { isTauriCommandUnavailable, normalizeConnectionTestResult } from "@/lib/
 import type { AnnotationFile, SchemaSnapshot } from "@/docs/types";
 import type { CollectionInfo } from "@/types/database";
 import type { SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
-import type { AiChatSelectionState, AiConfig, AiConfigItem, AiEffortCapability, AiEffortLevel, AiTestConnectionResult } from "@/types/ai";
+import type { AiChatSelectionState, AiConfig, AiConfigItem, AiEffortCapability, AiEffortLevel, AiTestConnectionResult, CcSwitchImportResult } from "@/types/ai";
 import type { SalesforceCurrentUser, SalesforceOAuthAuthorizeParams, SalesforceOAuthDevicePollResult, SalesforceOAuthDeviceStartResult, SalesforceOAuthRefreshResult, SalesforceOAuthToken } from "@/types/salesforce";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
 import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
@@ -158,7 +161,8 @@ import type { BuildCreatePartitionedTableSqlOptions, BuildTableOwnerChangeSqlOpt
 import type { BuildTableSelectSqlOptions } from "@/lib/table/tableSelectSql";
 import type { DatabaseSearchSql, DatabaseSearchSqlOptions, SearchResultWhereOptions } from "@/lib/database/databaseSearch";
 import type { DatabaseStructureSearchSql, DatabaseStructureSearchSqlOptions } from "@/lib/database/databaseStructureSearch";
-import type { BuildEditableObjectSourceSqlInput, BuildRoutineRenameObjectSourceInput } from "@/lib/table/objectSourceEditor";
+import type { BuildEditableObjectSourceSqlInput, BuildRoutineRenameObjectSourceInput, FingerprintOracleRoutineObjectSourceInput, RewriteOracleRoutineReferencesInput, ValidateOracleExecutableObjectSourceInput } from "@/lib/table/objectSourceEditor";
+import type { OracleTableReferenceRewriteInput, OracleViewRenameSource, OracleViewRenameSourceInput, OracleViewRenameSourceReview } from "@/types/database";
 import type { BuildViewDdlInput } from "@/lib/table/viewDdl";
 import type { BuildRenameObjectSqlOptions } from "@/lib/table/objectRenameSql";
 import type { CreateDatabaseSqlOptions } from "@/lib/database/createDatabaseSql";
@@ -859,6 +863,10 @@ export async function deleteAiConfig(configId: string): Promise<void> {
   return invoke("delete_ai_config", { configId });
 }
 
+export async function loadCcSwitchAiConfigs(): Promise<CcSwitchImportResult> {
+  return invoke("load_cc_switch_ai_configs");
+}
+
 export async function loadAiConfig(): Promise<AiConfig | null> {
   return invoke("load_ai_config");
 }
@@ -915,6 +923,10 @@ export interface WebMcpHttpSettings {
   allowedOrigins: string[];
 }
 
+export interface WebCapabilities {
+  passwordViewerEnabled: boolean;
+}
+
 export async function loadMcpHttpServerSettings(): Promise<McpHttpServerSettings> {
   return invoke("load_mcp_http_server_settings");
 }
@@ -941,6 +953,10 @@ export async function saveWebMcpHttpSettings(_settings: WebMcpHttpSettings): Pro
 
 export async function rotateWebMcpToken(): Promise<WebMcpHttpStatus> {
   throw new Error("Web MCP settings are available only in DBX Web");
+}
+
+export async function loadWebCapabilities(): Promise<WebCapabilities> {
+  return { passwordViewerEnabled: true };
 }
 
 export async function loadMaxAgentTurns(): Promise<number> {
@@ -1082,6 +1098,15 @@ export async function completeAppClose(action: "quit" | "hide"): Promise<void> {
 
 export async function requestAppClose(): Promise<void> {
   return invoke("request_app_close_from_window_controls");
+}
+
+/**
+ * #11787：告诉宿主快捷键录入态是否开启。Windows 上宿主据此关掉 WebView2 的浏览器加速键
+ * （F5/Ctrl+R 重载、Ctrl+F 查找、Ctrl+P 打印、Ctrl+± 缩放、F12 DevTools……），让这批键
+ * 在录入期间落到页面被录入态吞掉；退出录入即恢复。其余平台是空实现。
+ */
+export async function setShortcutRecording(recording: boolean): Promise<void> {
+  return invoke("set_shortcut_recording", { recording });
 }
 
 export interface DriverStoreMigrationResult {
@@ -1314,8 +1339,8 @@ export interface SqlFileEntry {
   children: SqlFileEntry[];
 }
 
-export async function listSqlFilesInFolder(folderPath: string, fileFilter?: string): Promise<SqlFileEntry[]> {
-  return invoke("list_sql_files_in_folder", { folderPath, fileFilter });
+export async function listSqlFilesInFolder(folderPath: string, fileFilter?: string, includeEmptyDirectories?: boolean): Promise<SqlFileEntry[]> {
+  return invoke("list_sql_files_in_folder", { folderPath, fileFilter, includeEmptyDirectories });
 }
 
 export async function createSqlFileInFolder(rootPath: string, directoryPath: string, fileName: string): Promise<string> {
@@ -1328,6 +1353,18 @@ export async function renameSqlFileInFolder(rootPath: string, filePath: string, 
 
 export async function deleteSqlFileInFolder(rootPath: string, filePath: string): Promise<void> {
   return invoke("delete_sql_file_in_folder", { rootPath, filePath });
+}
+
+export async function createSqlFolderInFolder(rootPath: string, directoryPath: string, folderName: string): Promise<string> {
+  return invoke("create_sql_folder_in_folder", { rootPath, directoryPath, folderName });
+}
+
+export async function renameSqlFolderInFolder(rootPath: string, folderPath: string, folderName: string): Promise<string> {
+  return invoke("rename_sql_folder_in_folder", { rootPath, folderPath, folderName });
+}
+
+export async function deleteSqlFolderInFolder(rootPath: string, folderPath: string): Promise<void> {
+  return invoke("delete_sql_folder_in_folder", { rootPath, folderPath });
 }
 
 export interface GlobalSearchRequest {
@@ -1406,6 +1443,17 @@ export interface AiConversation {
   /** One editable "send later" input saved while an active run occupies the
    *  conversation (parent PRD §5). Persisted with the conversation. */
   queuedInput?: string;
+  /** Ask/Agent mode the user picked for THIS conversation (#12075). Written
+   *  only by a picker operation, so a capability limit (vector DB, plugin
+   *  without a connection) never replaces it. Absent means "never picked": the
+   *  panel then falls back to the plugin context's mode and the settings
+   *  default. Plain string on purpose — a future mode must not need a schema
+   *  migration, so unknown values are validated in the frontend instead. */
+  assistantMode?: string;
+  /** Picker action entry for this conversation, `auto` included (#9118 / R8):
+   *  the record keeps the ENTRY the user chose, not the action a send routed
+   *  to. Same semantics as `assistantMode`. */
+  assistantAction?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -2336,6 +2384,14 @@ export async function buildExecutableObjectSourceStatements(input: BuildEditable
   return invoke("build_executable_object_source_statements", { input });
 }
 
+export async function validateOracleExecutableObjectSource(input: ValidateOracleExecutableObjectSourceInput): Promise<void> {
+  return invoke("validate_oracle_executable_object_source", { input });
+}
+
+export async function fingerprintOracleRoutineObjectSource(input: FingerprintOracleRoutineObjectSourceInput): Promise<string> {
+  return invoke("fingerprint_oracle_routine_object_source", { input });
+}
+
 export async function buildExecutableObjectSourceSql(input: BuildEditableObjectSourceSqlInput): Promise<string> {
   return invoke("build_executable_object_source_sql", { input });
 }
@@ -2348,12 +2404,32 @@ export async function buildRoutineRenameObjectSourceStatements(input: BuildRouti
   return invoke("build_routine_rename_object_source_statements", { input });
 }
 
+export async function rewriteOracleRoutineReferences(input: RewriteOracleRoutineReferencesInput): Promise<string> {
+  return invoke("rewrite_oracle_routine_references", { input });
+}
+
+export async function rewriteOracleTableReferences(input: OracleTableReferenceRewriteInput): Promise<string> {
+  return invoke("rewrite_oracle_table_references", { input });
+}
+
 export async function buildViewDdlSql(input: BuildViewDdlInput): Promise<string> {
   return invoke("build_view_ddl_sql", { input });
 }
 
-export async function buildTableStructureChangeSql(options: BuildTableStructureChangeSqlOptions): Promise<TableStructureChangeSql> {
-  return invoke("build_table_structure_change_sql", { options });
+export async function parseOracleObjectName(input: string): Promise<string> {
+  return invoke("parse_oracle_object_name", { input });
+}
+
+export async function buildOracleViewRenameSource(input: OracleViewRenameSourceInput): Promise<OracleViewRenameSource> {
+  return invoke("build_oracle_view_rename_source", { input });
+}
+
+export async function reviewOracleViewRenameSource(input: OracleViewRenameSourceInput): Promise<OracleViewRenameSourceReview> {
+  return invoke("review_oracle_view_rename_source", { input });
+}
+
+export async function buildTableStructureChangeSql(options: BuildTableStructureChangeSqlOptions, starrocks?: StarRocksAlterOptions): Promise<TableStructureChangeSql> {
+  return invoke("build_table_structure_change_sql", { options, starrocks });
 }
 
 export async function buildTableOwnerChangeSql(options: BuildTableOwnerChangeSqlOptions): Promise<TableStructureChangeSql> {
@@ -2385,8 +2461,8 @@ export async function applySqliteTableStructureChange(connectionId: string, data
   });
 }
 
-export async function buildCreateTableSql(options: BuildTableStructureChangeSqlOptions): Promise<TableStructureChangeSql> {
-  return invoke("build_create_table_sql", { options });
+export async function buildCreateTableSql(options: BuildTableStructureChangeSqlOptions, serverVersion?: string, dialectOptions?: CreateTableDialectOptions): Promise<TableStructureChangeSql> {
+  return invoke("build_create_table_sql", { options, serverVersion, dialectOptions });
 }
 
 export async function buildSingleColumnAlterSql(options: BuildSingleColumnAlterSqlOptions): Promise<TableStructureChangeSql> {
@@ -4781,8 +4857,8 @@ export async function vectorListCollections(connectionId: string, database?: str
   return documentListCollections(connectionId, database || "default");
 }
 
-export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, collation?: string, executionId?: string): Promise<MongoDocumentResult> {
-  return documentFindDocuments(connectionId, database, collection, skip, limit, filter, projection, sort, collation, executionId);
+export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, collation?: string, executionId?: string, includeTotal?: boolean): Promise<MongoDocumentResult> {
+  return documentFindDocuments(connectionId, database, collection, skip, limit, filter, projection, sort, collation, executionId, undefined, undefined, includeTotal);
 }
 
 export async function mongoFindOne(connectionId: string, database: string, collection: string, filter?: string, projection?: string, options?: string, executionId?: string): Promise<MongoDocumentResult> {
@@ -4815,6 +4891,7 @@ export async function documentFindDocuments(
   executionId?: string,
   cursor?: string,
   cursorPagination?: boolean,
+  includeTotal?: boolean,
 ): Promise<DocumentQueryResult> {
   return invoke("document_find_documents", {
     connectionId,
@@ -4828,6 +4905,7 @@ export async function documentFindDocuments(
     collation,
     cursor,
     cursorPagination,
+    includeTotal,
     executionId,
   });
 }
@@ -6487,6 +6565,53 @@ export async function databaseExportDestinationNeedsConfirmation(directory: stri
 
 export async function recordDatabaseExportDestination(directory: string): Promise<void> {
   await invoke("record_database_export_destination", { directory });
+}
+
+export async function startDamengDump(request: DamengDumpRequest, onProgress: (progress: DamengDumpProgress) => void): Promise<DamengDumpProgress> {
+  let unlisten: UnlistenFn | undefined;
+  let settled = false;
+  let resolveTerminal: (progress: DamengDumpProgress) => void = () => {};
+  let rejectTerminal: (error: unknown) => void = () => {};
+
+  const terminalProgress = new Promise<DamengDumpProgress>((resolve, reject) => {
+    resolveTerminal = resolve;
+    rejectTerminal = reject;
+  });
+
+  const finish = (callback: () => void) => {
+    if (settled) return;
+    settled = true;
+    unlisten?.();
+    callback();
+  };
+
+  try {
+    unlisten = await listen<DamengDumpProgress>("dameng-dump-progress", (event) => {
+      if (event.payload.taskId !== request.taskId) return;
+      onProgress(event.payload);
+      if (event.payload.status === "error") {
+        finish(() => rejectTerminal(new BackendErrorException(event.payload.error || "Dameng dump failed")));
+      } else if (event.payload.status === "done" || event.payload.status === "cancelled") {
+        finish(() => resolveTerminal(event.payload));
+      }
+    });
+    await invoke("start_dameng_dump", { request });
+    return await terminalProgress;
+  } catch (error) {
+    if (!settled) {
+      settled = true;
+      unlisten?.();
+    }
+    throw error instanceof BackendErrorException ? error : new BackendErrorException(error);
+  }
+}
+
+export async function cancelDamengDump(taskId: string): Promise<void> {
+  await invoke("cancel_dameng_dump", { taskId });
+}
+
+export async function resolveDamengDumpTool(binDir: string, kind: DamengDumpKind): Promise<string> {
+  return invoke("resolve_dameng_dump_tool", { binDir, kind });
 }
 
 export async function exportQueryResultCsv(filePath: string, columns: string[], rows: readonly (readonly XlsxCellValue[])[], csvQuoteMode: CsvQuoteMode = "all", nullLiteral?: string): Promise<void> {

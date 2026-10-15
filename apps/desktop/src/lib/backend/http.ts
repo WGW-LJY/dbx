@@ -1,5 +1,8 @@
+import type { StarRocksAlterOptions } from "@/lib/table/starrocksAlterOptions";
+import type { CreateTableDialectOptions } from "@/lib/table/starrocksPhysicalOptions";
 import type { MongoDumpFormat, MongoDumpSourceInput, MongoDumpCatalog, MongoRestoreSourcePreview, MongoDatabaseDumpRequest, MongoDatabaseRestoreRequest, MongoDatabaseDumpProgress } from "./mongodbDumpTypes";
 import type { MongoRestoreUpload, MongoSourceReadOptions } from "./mongodbDumpTypes";
+import type { DamengDumpKind, DamengDumpRequest, DamengDumpProgress } from "./damengDumpTypes";
 import type { UserSkillRootSettings, UserSkillsListResult, UserSkillsReadResult } from "@/types/userSkills";
 import type { DatabaseBackupCommand, DatabaseBackupBackgroundStatus } from "@/lib/backup/backgroundDatabaseBackup";
 import type { PluginUiStorageItemRef, SqlFileFailureLogExportPayload, SqlFileFailureLogInfo, SqlFileFailureLogKey, SqlFileFailureLogTextPayload, SyncCatalogItem, SyncSelection, SyncSnapshotCatalog } from "@/lib/backend/tauri";
@@ -235,7 +238,8 @@ import type { BuildCreatePartitionedTableSqlOptions, BuildTableOwnerChangeSqlOpt
 import type { BuildTableSelectSqlOptions } from "@/lib/table/tableSelectSql";
 import type { DatabaseSearchSql, DatabaseSearchSqlOptions, SearchResultWhereOptions } from "@/lib/database/databaseSearch";
 import type { DatabaseStructureSearchSql, DatabaseStructureSearchSqlOptions } from "@/lib/database/databaseStructureSearch";
-import type { BuildEditableObjectSourceSqlInput, BuildRoutineRenameObjectSourceInput } from "@/lib/table/objectSourceEditor";
+import type { BuildEditableObjectSourceSqlInput, BuildRoutineRenameObjectSourceInput, FingerprintOracleRoutineObjectSourceInput, RewriteOracleRoutineReferencesInput, ValidateOracleExecutableObjectSourceInput } from "@/lib/table/objectSourceEditor";
+import type { OracleTableReferenceRewriteInput, OracleViewRenameSource, OracleViewRenameSourceInput, OracleViewRenameSourceReview } from "@/types/database";
 import type { BuildViewDdlInput } from "@/lib/table/viewDdl";
 import type { BuildRenameObjectSqlOptions } from "@/lib/table/objectRenameSql";
 import type { CreateDatabaseSqlOptions } from "@/lib/database/createDatabaseSql";
@@ -1948,6 +1952,14 @@ export async function buildExecutableObjectSourceStatements(input: BuildEditable
   });
 }
 
+export async function validateOracleExecutableObjectSource(input: ValidateOracleExecutableObjectSourceInput): Promise<void> {
+  return post("/api/query/validate-oracle-executable-object-source", { input });
+}
+
+export async function fingerprintOracleRoutineObjectSource(input: FingerprintOracleRoutineObjectSourceInput): Promise<string> {
+  return post("/api/query/fingerprint-oracle-routine-object-source", { input });
+}
+
 export async function buildExecutableObjectSourceSql(input: BuildEditableObjectSourceSqlInput): Promise<string> {
   return post("/api/query/build-executable-object-source-sql", { input });
 }
@@ -1962,12 +1974,32 @@ export async function buildRoutineRenameObjectSourceStatements(input: BuildRouti
   });
 }
 
+export async function rewriteOracleRoutineReferences(input: RewriteOracleRoutineReferencesInput): Promise<string> {
+  return post("/api/query/rewrite-oracle-routine-references", { input });
+}
+
+export async function rewriteOracleTableReferences(input: OracleTableReferenceRewriteInput): Promise<string> {
+  return post("/api/query/rewrite-oracle-table-references", { input });
+}
+
 export async function buildViewDdlSql(input: BuildViewDdlInput): Promise<string> {
   return post("/api/query/build-view-ddl-sql", { input });
 }
 
-export async function buildTableStructureChangeSql(options: BuildTableStructureChangeSqlOptions): Promise<TableStructureChangeSql> {
-  return post("/api/query/build-table-structure-change-sql", { options });
+export async function parseOracleObjectName(input: string): Promise<string> {
+  return post("/api/query/parse-oracle-object-name", { input });
+}
+
+export async function buildOracleViewRenameSource(input: OracleViewRenameSourceInput): Promise<OracleViewRenameSource> {
+  return post("/api/query/build-oracle-view-rename-source", { input });
+}
+
+export async function reviewOracleViewRenameSource(input: OracleViewRenameSourceInput): Promise<OracleViewRenameSourceReview> {
+  return post("/api/query/review-oracle-view-rename-source", { input });
+}
+
+export async function buildTableStructureChangeSql(options: BuildTableStructureChangeSqlOptions, starrocks?: StarRocksAlterOptions): Promise<TableStructureChangeSql> {
+  return post("/api/query/build-table-structure-change-sql", { options, starrocks });
 }
 
 export async function buildTableOwnerChangeSql(options: BuildTableOwnerChangeSqlOptions): Promise<TableStructureChangeSql> {
@@ -1999,8 +2031,8 @@ export async function applySqliteTableStructureChange(connectionId: string, data
   });
 }
 
-export async function buildCreateTableSql(options: BuildTableStructureChangeSqlOptions): Promise<TableStructureChangeSql> {
-  return post("/api/query/build-create-table-sql", { options });
+export async function buildCreateTableSql(options: BuildTableStructureChangeSqlOptions, serverVersion?: string, dialectOptions?: CreateTableDialectOptions): Promise<TableStructureChangeSql> {
+  return post("/api/query/build-create-table-sql", { options, serverVersion, dialectOptions });
 }
 
 export async function buildSingleColumnAlterSql(options: BuildSingleColumnAlterSqlOptions): Promise<TableStructureChangeSql> {
@@ -2312,6 +2344,10 @@ export async function deleteAiConfig(configId: string): Promise<void> {
   return del(`/api/ai/config/${configId}`);
 }
 
+export async function loadCcSwitchAiConfigs(): Promise<import("@/types/ai").CcSwitchImportResult> {
+  throw new Error("ccSwitchImportDesktopOnly");
+}
+
 export async function loadDesktopSettings(): Promise<DesktopSettings> {
   try {
     const raw = safeLocalStorageGet(DESKTOP_SETTINGS_STORAGE_KEY);
@@ -2377,6 +2413,10 @@ export async function rotateWebMcpToken(): Promise<import("@/lib/backend/tauri")
   const res = await fetch(apiUrl("/api/app-settings/mcp-http/rotate-token"), { method: "POST", headers: { "X-DBX-MCP-Settings": "1" } });
   if (!res.ok) throw await backendResponseError(res);
   return res.json();
+}
+
+export async function loadWebCapabilities(): Promise<import("@/lib/backend/tauri").WebCapabilities> {
+  return get("/api/app-settings/web-capabilities");
 }
 
 export async function loadMaxAgentTurns(): Promise<number> {
@@ -2533,6 +2573,11 @@ export async function completeAppClose(_action: "quit" | "hide"): Promise<void> 
 }
 
 export async function requestAppClose(): Promise<void> {
+  return undefined;
+}
+
+/** #11787：Web 形态没有宿主层可配合（浏览器自行处理 Ctrl+W/Ctrl+T 等保留键），空实现。 */
+export async function setShortcutRecording(_recording: boolean): Promise<void> {
   return undefined;
 }
 
@@ -2942,7 +2987,7 @@ export interface SqlFileEntry {
   children: SqlFileEntry[];
 }
 
-export async function listSqlFilesInFolder(_folderPath: string, _fileFilter?: string): Promise<SqlFileEntry[]> {
+export async function listSqlFilesInFolder(_folderPath: string, _fileFilter?: string, _includeEmptyDirectories?: boolean): Promise<SqlFileEntry[]> {
   throw new Error("Listing SQL files in a folder is only available in the desktop app");
 }
 
@@ -2956,6 +3001,18 @@ export async function renameSqlFileInFolder(_rootPath: string, _filePath: string
 
 export async function deleteSqlFileInFolder(_rootPath: string, _filePath: string): Promise<void> {
   throw new Error("Managing SQL files in folders is only available in the desktop app");
+}
+
+export async function createSqlFolderInFolder(_rootPath: string, _directoryPath: string, _folderName: string): Promise<string> {
+  throw new Error("Managing SQL folders is only available in the desktop app");
+}
+
+export async function renameSqlFolderInFolder(_rootPath: string, _folderPath: string, _folderName: string): Promise<string> {
+  throw new Error("Managing SQL folders is only available in the desktop app");
+}
+
+export async function deleteSqlFolderInFolder(_rootPath: string, _folderPath: string): Promise<void> {
+  throw new Error("Managing SQL folders is only available in the desktop app");
 }
 
 export interface GlobalSearchRequest {
@@ -3505,6 +3562,22 @@ function downloadTableExportFile(exportId: string): void {
   const a = document.createElement("a");
   a.href = apiUrl(`/api/export/table/download/${exportId}`);
   a.click();
+}
+
+// Native dexp/dimp tools only exist next to a local Dameng client install, so
+// the web deployment has no server-side implementation by design.
+const DAMENG_DUMP_WEB_UNSUPPORTED = "Dameng native .dmp export/import requires the desktop application.";
+
+export async function startDamengDump(_request: DamengDumpRequest, _onProgress: (progress: DamengDumpProgress) => void): Promise<DamengDumpProgress> {
+  throw new Error(DAMENG_DUMP_WEB_UNSUPPORTED);
+}
+
+export async function cancelDamengDump(_taskId: string): Promise<void> {
+  throw new Error(DAMENG_DUMP_WEB_UNSUPPORTED);
+}
+
+export async function resolveDamengDumpTool(_binDir: string, _kind: DamengDumpKind): Promise<string> {
+  throw new Error(DAMENG_DUMP_WEB_UNSUPPORTED);
 }
 
 export async function cancelTableExport(exportId: string): Promise<void> {
@@ -4854,8 +4927,8 @@ export async function vectorRenameCollection(connectionId: string, database: str
   await post("/api/vector/rename-collection", { connectionId, database, collection, newName });
 }
 
-export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, collation?: string, executionId?: string): Promise<MongoDocumentResult> {
-  return documentFindDocuments(connectionId, database, collection, skip, limit, filter, projection, sort, collation, executionId);
+export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, collation?: string, executionId?: string, includeTotal?: boolean): Promise<MongoDocumentResult> {
+  return documentFindDocuments(connectionId, database, collection, skip, limit, filter, projection, sort, collation, executionId, undefined, undefined, includeTotal);
 }
 
 export async function mongoParseShellCommand(source: string): Promise<MongoCommand> {
@@ -4888,6 +4961,7 @@ export async function documentFindDocuments(
   executionId?: string,
   cursor?: string,
   cursorPagination?: boolean,
+  includeTotal?: boolean,
 ): Promise<DocumentQueryResult> {
   return post("/api/document-store/find-documents", {
     connectionId,
@@ -4901,6 +4975,7 @@ export async function documentFindDocuments(
     collation,
     cursor,
     cursorPagination,
+    includeTotal,
     executionId,
   });
 }
