@@ -16,6 +16,7 @@ import { canDropDatabaseTables, canEmptyDatabaseTables, useDatabaseTableEmpty } 
 import { useI18n } from "vue-i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
 import {
+  Ban,
   BarChart3,
   BookOpen,
   Braces,
@@ -87,7 +88,7 @@ import { parseDynamicMenuResponse, renderDynamicMenuEntries, type DynamicMenuAct
 import type { PluginContextMenuInvocation } from "@/lib/plugins/pluginContext";
 import type { InstalledPlugin, PluginContextMenuContribution, PluginWorkbenchContribution } from "@/types/database";
 import { useDatabaseOptions } from "@/composables/useDatabaseOptions";
-import type { ColumnInfo, ConnectionConfig, DatabaseType, TreeNode, TreeNodeType } from "@/types/database";
+import type { ColumnInfo, ConnectionConfig, DatabaseType, TreeNode, TreeNodeType, TriggerInfo } from "@/types/database";
 import * as api from "@/lib/backend/api";
 import type { ElasticsearchIndexMetadataKind } from "@/lib/backend/tauri";
 import { queryTimeoutSecsForConnection } from "@/lib/sql/queryTimeout";
@@ -117,7 +118,7 @@ import { isXuguSyntheticTreeNode } from "@/lib/sidebar/xuguPublicSynonyms";
 import { buildXuguSchedulerJobSql, type XuguSchedulerJobAction } from "@/lib/database/xuguSchedulerJobSql";
 import { canViewDatabaseObjectDependencies, databaseDependencyProviderFor } from "@/lib/database/databaseObjectDependencies";
 import { elasticsearchClearIndexPreview, isElasticsearchClearConfirmed, isElasticsearchIndexPattern } from "@/lib/sidebar/elasticsearchIndexActions";
-import { mysqlObjectTemplateForGroup } from "@/lib/sidebar/mysqlObjectTemplates";
+import { sidebarObjectTemplateForGroup } from "@/lib/sidebar/databaseObjectTemplates";
 import { buildTableDeleteTemplate, buildTableInsertTemplate, buildTableSelectTemplate, buildTableUpdateTemplate, insertTemplatePrimaryKeyConflicts } from "@/lib/table/tableSqlTemplates";
 import SqlTemplateInsertRowsDialog from "@/components/sidebar/SqlTemplateInsertRowsDialog.vue";
 import { joinExportedDdls } from "@/lib/export/ddlExport";
@@ -257,6 +258,7 @@ import { executeWithProductionContextGuard, executeWithProductionSqlGuard } from
 import { connectionIsEffectivelyReadOnly } from "@/lib/database/readOnlyWriteAccess";
 import { buildXuguCompileSql } from "@/lib/database/xuguCompileSql";
 import { buildDamengCompileViewSql } from "@/lib/database/damengCompileSql";
+import { buildTriggerToggleSql, supportsTriggerToggle } from "@/lib/database/triggerToggleSql";
 import type { SidebarDataOpenRequest } from "@/lib/sidebar/sidebarDataOpenCoordinator";
 import { createSidebarActionTarget, findSidebarActionTarget, releaseRemovedSidebarActionTarget, type SidebarActionTarget } from "@/lib/sidebar/sidebarActionTarget";
 import { collapseSubtreeDescendants } from "@/lib/sidebar/sidebarTreeCollapse";
@@ -962,7 +964,7 @@ async function toggle(requestId = beginNavigationRequest()) {
   // Keep the click path aligned with every object-group definition. In
   // particular, schema-level trigger/type groups have no tableName, so they
   // must use the generic object loader rather than the table-trigger loader.
-  const databaseObjectGroup = !!objectTypesForGroupNode(node.type);
+  const databaseObjectGroup = !!objectTypesForGroupNode(node.type) && !node.tableName;
   const needsConfiguredTablePageDrain = node.type === "group-tables" && connectionStore.getConfig(node.connectionId || "")?.sidebar_auto_load_all_tables === true && hasTableTreeLoadMore(node.children ?? []);
   if (databaseObjectGroup && connectionStore.canUseLoadedTreeNodeToggle(node) && !needsConfiguredTablePageDrain) {
     node.isExpanded = !node.isExpanded;
@@ -3068,6 +3070,99 @@ async function executeXuguSchedulerJobAction(action: XuguSchedulerJobAction) {
   }
 }
 
+function findTreeNodeById(nodes: readonly TreeNode[], id: string): TreeNode | null {
+  for (const item of nodes) {
+    if (item.id === id) return item;
+    if (item.children?.length) {
+      const found = findTreeNodeById(item.children, id);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+async function toggleTriggerState(node: TreeNode, enabled: boolean) {
+  if (!node.connectionId || !node.database) return;
+  const databaseType = databaseTypeForNode(node);
+  const triggerName = node.meta && "name" in node.meta ? (node.meta as TriggerInfo).name : node.objectName || node.label.replace(/\s+\(.+\)$/, "");
+  if (!triggerName) return;
+
+  const sql = buildTriggerToggleSql({
+    databaseType,
+    schema: node.schema,
+    tableName: node.tableName,
+    triggerName,
+    enabled,
+  });
+  if (!sql) return;
+
+  try {
+    await connectionStore.ensureConnected(node.connectionId);
+    const executed = await executeTreeNodeSqlWithProductionGuard(node, sql, { database: node.database, schema: node.schema });
+    if (!executed) return;
+    const updatedMeta: TriggerInfo = {
+      // The fallback must satisfy TriggerInfo; the spread ternary's narrower
+      // arm is what tripped vue-tsc (TS2322) in CI.
+      ...(node.meta && typeof node.meta === "object" ? (node.meta as TriggerInfo) : { name: triggerName, event: "", timing: "" }),
+      enabled,
+    };
+    // `node` may be a frozen action-target copy (createSidebarActionTarget);
+    // assigning to it throws in strict mode, and the live node below is the
+    // only assignment that matters.
+    const liveNode = findSidebarActionTarget(connectionStore.treeNodes, createSidebarActionTarget(node)) ?? findTreeNodeById(connectionStore.treeNodes, node.id);
+    if (liveNode) {
+      liveNode.meta = updatedMeta;
+    }
+    toast(t(enabled ? "contextMenu.enableTriggerSuccess" : "contextMenu.disableTriggerSuccess", { name: triggerName }), 3000);
+    await connectionStore.refreshTreeNode(node);
+  } catch (e: any) {
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
+function triggerToggleMenuItems(node: TreeNode): ContextMenuItem[] {
+  const dbType = databaseTypeForNode(node);
+  if (!supportsTriggerToggle(dbType)) return [];
+  const triggerName = node.meta && "name" in node.meta ? (node.meta as TriggerInfo).name : node.objectName || node.label.replace(/\s+\(.+\)$/, "");
+  if (!triggerName) return [];
+  if (["postgres", "kingbase", "opengauss", "vastbase", "highgo", "uxdb", "gaussdb", "kwdb"].includes(dbType || "") && !node.tableName) {
+    return [];
+  }
+
+  const trigger = node.meta as TriggerInfo | undefined;
+  const currentEnabled = trigger?.enabled;
+  const items: ContextMenuItem[] = [];
+
+  if (currentEnabled === false) {
+    items.push({
+      label: t("contextMenu.enableTrigger"),
+      action: () => toggleTriggerState(node, true),
+      icon: Play,
+    });
+  } else if (currentEnabled === true) {
+    items.push({
+      label: t("contextMenu.disableTrigger"),
+      action: () => toggleTriggerState(node, false),
+      icon: Ban,
+    });
+  } else {
+    items.push(
+      {
+        label: t("contextMenu.enableTrigger"),
+        action: () => toggleTriggerState(node, true),
+        icon: Play,
+      },
+      {
+        label: t("contextMenu.disableTrigger"),
+        action: () => toggleTriggerState(node, false),
+        icon: Ban,
+      },
+    );
+  }
+
+  return items;
+}
+
 function requestDropObject() {
   void refreshDropObjectPreviewSql();
   showDropObjectConfirm.value = true;
@@ -4440,7 +4535,7 @@ const canSetCreateDatabaseCharset = computed(() => {
 
 const canSetCreateDatabaseLocale = computed(() => {
   const config = activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined;
-  return connectionNamespaceCreationTarget(config) === "database" && supportsCreateDatabaseLocale(config?.db_type, config?.driver_profile);
+  return connectionNamespaceCreationTarget(config) === "database" && supportsCreateDatabaseLocale(config?.db_type);
 });
 
 const canDropDatabase = computed(() => {
@@ -5614,10 +5709,10 @@ async function confirmDeleteHBaseTable() {
   }
 }
 
-function createMysqlObjectTemplate() {
+function createSidebarObjectTemplate() {
   const node = activeNode.value;
   if (!node.connectionId || !node.database) return;
-  const template = mysqlObjectTemplateForGroup(connectionStore.getConfig(node.connectionId), node);
+  const template = sidebarObjectTemplateForGroup(connectionStore.getConfig(node.connectionId), node);
   if (!template) return;
   connectionStore.activeConnectionId = node.connectionId;
   const tabId = queryStore.createTab(node.connectionId, node.database, t(template.titleKey), "query", node.schema, undefined, node.catalog);
@@ -7484,6 +7579,11 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     if (node.type === "trigger") {
       items.push({ label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
       items.push({ label: t("contextMenu.changeOpenMode"), action: () => emit("open-settings", "navigation"), icon: Settings2 });
+      const toggleItems = triggerToggleMenuItems(node);
+      if (toggleItems.length > 0) {
+        items.push({ label: "", separator: true });
+        items.push(...toggleItems);
+      }
     }
     if (currentDatabaseType() === "xugu" && buildXuguCompileSql({ objectType: node.type, schema: node.schema, name: node.objectName || node.label })) {
       items.push({ label: t("contextMenu.compileObject"), action: compileXuguObject, icon: Wrench });
@@ -7611,6 +7711,13 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     if (canViewDatabaseObjectDependencies(currentDatabaseType(), node)) {
       items.push({ label: t("contextMenu.viewDependencies"), action: openDatabaseObjectDependencies, icon: Network });
     }
+    if (node.type === "trigger") {
+      const toggleItems = triggerToggleMenuItems(node);
+      if (toggleItems.length > 0) {
+        items.push({ label: "", separator: true });
+        items.push(...toggleItems);
+      }
+    }
     if (node.type === "package" && currentDatabaseType() === "xugu" && node.xuguPackageBodyAvailable === true) {
       items.push({
         label: `${t("contextMenu.viewSource")} (${t("objects.packageBody")})`,
@@ -7666,11 +7773,11 @@ function buildObjectGroupSidebarMenu(context: SidebarMenuFactoryContext): boolea
   appendTableVGroupContainerItems(node, items);
   // 9. Group Labels (group-columns, group-tables, etc.)
   if (isGroupLabel(node)) {
-    const mysqlObjectTemplate = node.connectionId ? mysqlObjectTemplateForGroup(connectionStore.getConfig(node.connectionId), node) : null;
+    const objectTemplate = node.connectionId ? sidebarObjectTemplateForGroup(connectionStore.getConfig(node.connectionId), node) : null;
     const hasMongoCreateIndexAction = node.type === "group-indexes" && canCreateMongoIndex.value;
     const hasMongoDropAllIndexesAction = node.type === "group-indexes" && canDropAllMongoIndexes.value;
     const canCreateGroupView = node.type === "group-views" && !!node.connectionId && !!node.database && !["neo4j", "nebula"].includes(currentDatabaseType() || "");
-    const hasGroupAction = (node.type === "group-tables" && canCreateTable.value) || canCreateGroupView || !!mysqlObjectTemplate || hasMongoCreateIndexAction || hasMongoDropAllIndexesAction;
+    const hasGroupAction = (node.type === "group-tables" && canCreateTable.value) || canCreateGroupView || !!objectTemplate || hasMongoCreateIndexAction || hasMongoDropAllIndexesAction;
     const canLoadAllObjectGroup = node.type === "group-tables" || node.type === "group-dolt-system-tables" || node.type === "group-views" || node.type === "group-materialized-views";
     if (node.type === "group-tables" && canCreateTable.value) {
       items.push({ label: t("contextMenu.createTable"), action: createTable, icon: Plus });
@@ -7687,8 +7794,8 @@ function buildObjectGroupSidebarMenu(context: SidebarMenuFactoryContext): boolea
     if (node.type === "group-events" && node.connectionId && node.database) {
       items.push({ label: t("contextMenu.createEvent"), action: openMysqlEventCreateEditor, icon: Plus });
     }
-    if (mysqlObjectTemplate) {
-      items.push({ label: t(mysqlObjectTemplate.titleKey), action: createMysqlObjectTemplate, icon: Plus });
+    if (objectTemplate) {
+      items.push({ label: t(objectTemplate.titleKey), action: createSidebarObjectTemplate, icon: Plus });
     }
     if (hasMongoCreateIndexAction) {
       items.push({ label: t("contextMenu.createMongoIndex"), action: openCreateMongoIndexDialog, icon: Plus });
