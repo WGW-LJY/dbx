@@ -90,6 +90,7 @@ import DataGridToolbar from "@/components/grid/DataGridToolbar.vue";
 import DataGridVirtualRowIdentifier from "@/components/grid/DataGridVirtualRowIdentifier.vue";
 import DataGridExtractorDialog from "@/components/grid/DataGridExtractorDialog.vue";
 import DataGridColumnHeader from "@/components/grid/DataGridColumnHeader.vue";
+import { formatDataGridColumnMetadataForCopy } from "@/lib/dataGrid/dataGridColumnMetadataCopy";
 import DataGridQueryControls from "@/components/grid/DataGridQueryControls.vue";
 import DataGridFilterBuilder from "@/components/grid/DataGridFilterBuilder.vue";
 import DataGridFilterModeOrderDialog from "@/components/grid/DataGridFilterModeOrderDialog.vue";
@@ -1224,7 +1225,7 @@ const filterBuilderColumns = computed(() =>
     resultColumnTypes: props.result.column_types,
   }),
 );
-const conditionColumns = computed(() => dataGridConditionColumnOptions(props.tableMeta ? filterBuilderColumns.value.map((column) => column.columnInfo ?? column.name) : props.result.columns, resolvedDatabaseType.value));
+const conditionColumns = computed(() => dataGridConditionColumnOptions(props.tableMeta ? filterBuilderColumns.value.map((column) => ({ name: column.name, dataType: column.columnInfo?.data_type, comment: column.columnInfo?.comment ?? undefined })) : props.result.columns, resolvedDatabaseType.value));
 const conditionIdentifierQuote = computed(() => dataGridConditionIdentifierQuote(resolvedDatabaseType.value, connectionStore.connectionIdentifierQuote?.(props.connectionId)));
 const conditionHistoryScope = computed(() => ({
   connectionId: props.connectionId,
@@ -4476,7 +4477,7 @@ async function refreshSavedRows(request: { dirtyRows: ReadonlyMap<number, Readon
   const planResult = buildDataGridSavedRowRefreshPlan({
     context: props.context,
     infiniteScroll: infiniteScrollEnabled.value,
-    filterActive: !!currentWhereInput() || hasLocalColumnFilters.value || (dataGridSearchMode.value === "filter" && !!deferredClientSearchText.value),
+    filterActive: !!currentWhereInput() || hasLocalColumnFilters.value,
     orderActive: !!effectiveOrderBy(),
     columns: request.columns,
     sourceColumns: props.sourceColumns,
@@ -6674,6 +6675,7 @@ function selectionFrameKindForCell(rowIndex: number, visibleColIdx: number): "si
 // 行号的选区覆盖指示（Navicat 风格），但行选中（--selected）和行状态色（新增/编辑/删除）优先，
 // 与 canvas 渲染器的 rowNumberFill 优先级顺序保持一致
 function rowNumberShowsSelectionTint(item: RowItem): boolean {
+  if (isSelectingAll.value) return false;
   if (isRowSelected(item.id)) return false;
   if (item.status !== "clean") return false;
   const frames = selectionFramesData.value.frames;
@@ -8788,6 +8790,7 @@ function drawCanvasGrid() {
     rowCellsUseSelectionVisual,
     cellIsSelected,
     selectionFrames: selectionFramesData.value.frames,
+    selectingAll: isSelectingAll.value,
     cellCanHover: canEditCellItem,
     infiniteScrollEnabled: infiniteScrollEnabled.value,
     pageOffset: rowNumberPageOffset(),
@@ -9141,7 +9144,16 @@ const {
   sql: computed(() => props.sql),
   exportSql: computed(() => props.exportSql),
   pageSql: computed(() => props.pageSql),
-  tableMeta: computed(() => (props.tableMeta ? { ...props.tableMeta } : undefined)),
+  tableMeta: computed(() => {
+    if (!props.tableMeta) return undefined;
+    const database = props.tableMeta.database ?? props.executionDatabase ?? props.database;
+    const schema = props.tableMeta.schema ?? props.schema;
+    return {
+      ...props.tableMeta,
+      ...(database && !props.tableMeta.database ? { database } : {}),
+      ...(schema && !props.tableMeta.schema ? { schema } : {}),
+    };
+  }),
   includeDatabaseName: computed(() => settingsStore.editorSettings.generateSqlIncludeDatabaseName),
   hasUniqueQueryInsertTarget: computed(() => props.hasUniqueQueryInsertTarget === true),
   copyInsertTargetLabel: computed(() => props.tableMeta?.tableName ?? props.customSaveHandler?.targetLabel),
@@ -9155,6 +9167,7 @@ const {
   columnComments: visibleColumnComments,
   allColumnComments,
   displayValue: (value, index) => formatCell(value, index, undefined, false),
+  editValue: (value, index) => cellEditorTextForValue(value, index),
   hasColumnFormatter: (index: number) => Boolean(resolvedColumnFormatters.value[index]),
   applyColumnFormattersOnExport: computed(() => settingsStore.editorSettings.applyColumnFormattersOnExport),
   cellClipboardText: (value) => (usesMongoDocumentGridValues.value ? mongoDocumentGridClipboardText(value) : undefined),
@@ -9223,6 +9236,8 @@ function copyExtractorLabel(extractor: DataGridCopyExtractorId): string {
     html: "HTML",
     xml: "XML",
     pretty: t("grid.copyExtractorPretty"),
+    dbunit: "DbUnit",
+    php: "PHP",
   };
   return labels[extractor];
 }
@@ -9242,6 +9257,86 @@ function sqlInsertModeLabel(mode: DataGridPrimaryKeyMode): string {
 const selectedCopyPreference = computed(() => settingsStore.editorSettings.dataGridCopyExtractor);
 const defaultCopyPreferenceLabel = computed(() => copyPreferenceLabel(selectedCopyPreference.value));
 const extractorConfigOpen = ref(false);
+const advancedCopyOpen = ref(false);
+let advancedCopySession = 0;
+const advancedCopyGeneration = ref(0);
+let advancedCopyBinding: ReturnType<typeof advancedCopySnapshot> | undefined;
+
+const advancedCopySelectionKey = computed(() =>
+  JSON.stringify({
+    rows: [...selectedRowIds.value].sort((a, b) => a - b),
+    columns: [...selectedColumnIndexes.value].sort((a, b) => a - b),
+    cells: [...selectedCellKeys.value].sort(),
+    range: selectedRange.value,
+    anchor: selectionAnchor.value,
+    focus: selectionFocus.value,
+  }),
+);
+
+watch(
+  [() => props.result, advancedCopySelectionKey],
+  () => {
+    advancedCopyGeneration.value += 1;
+  },
+  { flush: "sync" },
+);
+
+function advancedCopySnapshot() {
+  return {
+    result: props.result,
+    rows: props.result.rows,
+    columns: props.result.columns,
+    selection: advancedCopySelectionKey.value,
+    generation: advancedCopyGeneration.value,
+  };
+}
+
+function isAdvancedCopySessionValid(session: number, binding: ReturnType<typeof advancedCopySnapshot>): boolean {
+  const current = advancedCopySnapshot();
+  return advancedCopyOpen.value && session === advancedCopySession && current.result === binding.result && current.rows === binding.rows && current.columns === binding.columns && current.selection === binding.selection && current.generation === binding.generation;
+}
+
+function openAdvancedCopy() {
+  advancedCopySession += 1;
+  advancedCopyBinding = advancedCopySnapshot();
+  advancedCopyOpen.value = true;
+}
+
+watch(advancedCopyOpen, (open) => {
+  if (open) return;
+  advancedCopySession += 1;
+  advancedCopyBinding = undefined;
+});
+onUnmounted(() => {
+  advancedCopySession += 1;
+  advancedCopyOpen.value = false;
+});
+
+function canCopyAdvancedFormat(preference: DataGridCopyPreference): boolean {
+  if (preference === "smart") return canCopyWithExtractor("raw") || canCopyWithExtractor("tsv");
+  return canCopyWithExtractor(preference);
+}
+
+async function copyAdvancedFormat(preference: DataGridCopyPreference, extractorOptions: typeof settingsStore.editorSettings.dataGridExtractorOptions): Promise<boolean> {
+  const session = advancedCopySession;
+  const binding = advancedCopyBinding;
+  const isValid = () => !!binding && isAdvancedCopySessionValid(session, binding);
+  if (!isValid()) throw new Error(t("grid.copyExtractorSelectionChanged"));
+  const copied = await copyWithPreference(preference, extractorOptions, isValid);
+  if (!copied && !isValid()) throw new Error(t("grid.copyExtractorSelectionChanged"));
+  return copied;
+}
+
+async function previewAdvancedCopy(preference: DataGridCopyPreference, extractorOptions: typeof settingsStore.editorSettings.dataGridExtractorOptions) {
+  const session = advancedCopySession;
+  const binding = advancedCopyBinding;
+  const isValid = () => !!binding && isAdvancedCopySessionValid(session, binding);
+  if (!isValid()) throw new Error(t("grid.copyExtractorSelectionChanged"));
+  const preview = await previewWithPreference(preference, extractorOptions);
+  if (!isValid()) throw new Error(t("grid.copyExtractorSelectionChanged"));
+  return preview;
+}
+
 const copyPreferenceMenuItems = computed(() =>
   DATA_GRID_DEFAULT_COPY_PREFERENCES.map((preference) => {
     const extractor = preference === "smart" ? undefined : preference;
@@ -9252,6 +9347,13 @@ const copyPreferenceMenuItems = computed(() =>
       separatorBefore: extractor ? DATA_GRID_COPY_EXTRACTOR_DESCRIPTORS[extractor].separatorBefore : false,
     };
   }),
+);
+const visibleCopyExtractorItems = computed(() =>
+  DATA_GRID_COPY_EXTRACTOR_IDS.map((extractor) => ({
+    value: extractor,
+    label: copyExtractorLabel(extractor),
+    disabled: extractorUnavailableForDatabase(extractor, props.databaseType) || ((extractor === "sql-updates" || extractor === "sql-deletes-inserts") && !props.tableMeta?.primaryKeys.length),
+  })),
 );
 function openExtractorConfiguration() {
   extractorConfigOpen.value = true;
@@ -9273,10 +9375,11 @@ function sqlInsertExtractorOptions(primaryKeyMode: DataGridPrimaryKeyMode) {
   };
 }
 
-function saveExtractorConfiguration(value: { preference: DataGridCopyPreference; options: typeof settingsStore.editorSettings.dataGridExtractorOptions }) {
+function saveExtractorConfiguration(value: { preference: DataGridCopyPreference; options: typeof settingsStore.editorSettings.dataGridExtractorOptions; visibleCopyExtractors: typeof settingsStore.editorSettings.dataGridVisibleCopyExtractors }) {
   settingsStore.updateEditorSettings({
     dataGridCopyExtractor: value.preference,
     dataGridExtractorOptions: value.options,
+    dataGridVisibleCopyExtractors: value.visibleCopyExtractors,
   });
   // The dialog closes on save; without this the write is invisible and users
   // report the save button as doing nothing (#9872).
@@ -12169,6 +12272,29 @@ function copyHeaderColumnOrSelected() {
   void copyHeaderColumn();
 }
 
+function copyContextColumnMetadata() {
+  const visibleIndexes =
+    contextHeaderVisibleColIdx.value !== null && selectedColumnIndexes.value.has(contextHeaderVisibleColIdx.value) && selectedColumnIndexes.value.size > 1 ? [...selectedColumnIndexes.value].sort((a, b) => a - b) : contextHeaderVisibleColIdx.value !== null ? [contextHeaderVisibleColIdx.value] : [];
+  const rows = visibleIndexes
+    .map((visibleIndex) => {
+      const actualIndex = visibleColumnIndexes.value[visibleIndex];
+      const name = visibleColumns.value[visibleIndex];
+      if (actualIndex === undefined || name === undefined) return undefined;
+      const info = tableColumnForGridColumn(actualIndex);
+      const sourceName = props.sourceColumns?.[actualIndex] ?? info?.name;
+      return {
+        name,
+        type: allColumnTypes.value[actualIndex],
+        source: sourceName,
+        nullable: info ? info.is_nullable : undefined,
+        comment: resolvedColumnComment(name, actualIndex) || undefined,
+      };
+    })
+    .filter((row): row is NonNullable<typeof row> => row !== undefined);
+  if (rows.length === 0) return;
+  void copyText(formatDataGridColumnMetadataForCopy(rows));
+}
+
 // 「复制列注释」的目标列：显式多选时按选中列，否则用右键命中的那列。
 function contextCommentActualColumnIndexes(): number[] {
   if (contextHeaderColumnIndex.value === null) return [];
@@ -13914,6 +14040,7 @@ function buildExtractorContextItems(destination: "copy" | "export" = "copy"): Co
   const items: ContextMenuItem[] = [];
   let separatorPending = false;
   for (const extractor of DATA_GRID_COPY_EXTRACTOR_IDS) {
+    if (destination === "copy" && !settingsStore.editorSettings.dataGridVisibleCopyExtractors.includes(extractor)) continue;
     if (extractor === "raw" && !canCopyWithExtractor(extractor)) continue;
     const descriptor = DATA_GRID_COPY_EXTRACTOR_DESCRIPTORS[extractor];
     if (descriptor.separatorBefore) {
@@ -13970,6 +14097,12 @@ function copySubmenu(): ContextMenuItem {
       label: t("grid.copyExtractorConfigure"),
       icon: Settings2,
       action: openExtractorConfiguration,
+    },
+    {
+      label: t("grid.copyExtractorAdvancedCopy"),
+      icon: Copy,
+      action: openAdvancedCopy,
+      disabled: !copyPreferenceMenuItems.value.some((item) => !item.disabled && canCopyAdvancedFormat(item.value)),
     },
     defaultCopyPreferenceContextItem(),
     { label: "", separator: true },
@@ -14149,6 +14282,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
       headerColumn: !!contextHeaderColumn.value,
       contextColumn: !!contextColumn.value,
       canCopyAlterSql: canCopyAlterColumnSql.value,
+      canCopyMetadata: true,
       canCopyComment: contextCopyableColumnComments.value.length > 0,
       canFilter: canUseWhereSearch.value,
       hasSort: !!sortCol.value,
@@ -14168,6 +14302,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                 count: selectedColumnNamesForCopy.value.length,
               })
             : t("grid.copyColumnName"),
+        copyMetadata: t("grid.copyColumnMetadata"),
         copyComment: t("grid.copyColumnComment"),
         copyNames: t("grid.copyColumnNames"),
         details: t("grid.openColumnDetailsDialog"),
@@ -14201,6 +14336,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
         copyNames: openCopyAllColumnNamesDialog,
         details: openContextColumnDetailDialog,
         copyAlterSql: copyAlterColumnSql,
+        copyMetadata: copyContextColumnMetadata,
         sort: applyContextSort,
         freezeToColumn: () => {
           const idx = contextHeaderVisibleColIdx.value;
@@ -15069,9 +15205,6 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                 <div class="data-grid-header-row flex w-(--header-total-w) font-semibold text-foreground">
                   <div
                     class="data-grid-header-cell shrink-0 px-2 py-1.5 border-r w-(--row-num-w) border-border text-center text-muted-foreground select-none cursor-default hover:bg-gray-200 dark:hover:bg-gray-800 sticky left-0 z-20"
-                    :class="{
-                      'data-grid-header-cell--selected': isSelectingAll,
-                    }"
                     @click="selectAllCells"
                     @contextmenu="invalidateContextMenuTarget"
                   >
@@ -16609,7 +16742,32 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
       </DialogContent>
     </Dialog>
 
-    <DataGridExtractorDialog v-model:open="extractorConfigOpen" :preference="selectedCopyPreference" :options="settingsStore.editorSettings.dataGridExtractorOptions" :items="copyPreferenceMenuItems" :preview="previewWithPreference" @save="saveExtractorConfiguration" />
+    <DataGridExtractorDialog
+      v-model:open="extractorConfigOpen"
+      mode="configure"
+      :preference="selectedCopyPreference"
+      :source-table-name="props.tableMeta?.tableName"
+      :visible-copy-extractors="settingsStore.editorSettings.dataGridVisibleCopyExtractors"
+      :options="settingsStore.editorSettings.dataGridExtractorOptions"
+      :items="copyPreferenceMenuItems"
+      :visible-items="visibleCopyExtractorItems"
+      :preview="previewWithPreference"
+      @save="saveExtractorConfiguration"
+    />
+    <DataGridExtractorDialog
+      v-model:open="advancedCopyOpen"
+      mode="copy"
+      :preference="selectedCopyPreference"
+      :source-table-name="props.tableMeta?.tableName"
+      :visible-copy-extractors="settingsStore.editorSettings.dataGridVisibleCopyExtractors"
+      :options="settingsStore.editorSettings.dataGridExtractorOptions"
+      :items="copyPreferenceMenuItems"
+      :visible-items="visibleCopyExtractorItems"
+      :preview="previewAdvancedCopy"
+      :preview-session-key="advancedCopyGeneration"
+      :can-copy="canCopyAdvancedFormat"
+      :copy="copyAdvancedFormat"
+    />
     <DataGridCopyColumnNamesDialog v-if="copyColumnNamesDialogMounted" v-model:open="copyColumnNamesDialogOpen" :column-names="copyColumnNamesDialogColumns" :database-type="resolvedDatabaseType" :column-comments="columnCommentMap" @copy="copyText" />
     <GridSnapshotDialog v-model:open="gridSnapshotOpen" :source="gridSnapshotSource" />
     <DataGridFilterModeOrderDialog v-model:open="filterModeOrderDialogOpen" :database-type="resolvedDatabaseType" :options="supportedFilterModeOptions" @saved="onFilterModeOrderSaved" />

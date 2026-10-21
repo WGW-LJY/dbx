@@ -136,6 +136,7 @@ import { pluginFieldIsRequired, pluginFieldIsVisible } from "@/lib/plugins/plugi
 import { detectMqUiAuthKind, isMqAuthKindAllowedForSystem, type MqUiAuthKind } from "@/lib/connection/mqAuth";
 import { driverInstallProgressChannel, driverInstallProgressPercent, isDriverInstallProgressForOperation, requestAgentInstallCancellation, resolveAgentInstallOutcome, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
 import { requiresSqlServerLegacyCompatibilityComponent, setSqlServerLegacyCompatibilityConfig, sqlServerUsesLegacyCompatibility, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
+import { parseSqlServerHostPort } from "@/lib/sqlserver/sqlServerHostPort";
 import { normalizeNacosConsoleUrl, normalizeNacosEndpoint, normalizeNacosMetricsUrl, parseNacosManagedNamespaces } from "@/lib/nacos/nacosAdmin";
 import { loadReadableNacosNamespaces, nacosNamespaceIdentity, normalizeNacosNamespaceSelection } from "@/lib/nacos/nacosNamespaceVisibility";
 import {
@@ -170,8 +171,8 @@ import {
   Trash2,
 } from "@lucide/vue";
 import { buildDraftVisibleDatabasesConnectionId, connectionCanChooseVisibleDatabases, initialVisibleDatabaseSelection, visibleObjectFiltersNeedReset } from "@/lib/connection/connectionVisibleDatabases";
-import { resolveVisibleDatabaseSaveAction } from "@/components/sidebar/visibleDatabasesDialogState";
-import { canSaveVisibleDatabaseSelection, connectionUsesVisibleSchemaFilter, filterDatabaseNamesForVisiblePicker, filterSchemaNamesForVisiblePicker, buildDraftVisibleSchemasConnectionId, normalizeVisibleSchemaSelection } from "@/lib/database/visibleDatabases";
+import { resolveVisibleDatabaseSaveAction, visibleDatabasePatternsWithoutMatchAll } from "@/components/sidebar/visibleDatabasesDialogState";
+import { MATCH_ALL_VISIBLE_DATABASE_PATTERN, canSaveVisibleDatabaseSelection, connectionUsesVisibleSchemaFilter, filterDatabaseNamesForVisiblePicker, filterSchemaNamesForVisiblePicker, buildDraftVisibleSchemasConnectionId, normalizeVisibleSchemaSelection } from "@/lib/database/visibleDatabases";
 import { isSchemaAware, isSingleDatabase, supportsDataDictionary, supportsTransaction } from "@/lib/database/databaseFeatureSupport";
 import { normalizeConnectionScope, normalizeConnectionTimeouts } from "@/lib/connection/connectionSubmitNormalization";
 import { databaseConnectionFormKind, databaseManifestEntry } from "@/lib/database/databaseDriverManifest";
@@ -805,6 +806,34 @@ function setSqlServerPortExplicit(config: Pick<ConnectionConfig, "db_type"> & { 
 
 function markSqlServerPortExplicit() {
   setSqlServerPortExplicit(form.value, true);
+}
+
+function handleHostBlur() {
+  if (form.value.db_type === "sqlserver") {
+    const parsed = parseSqlServerHostPort(form.value.host, form.value.port);
+    form.value.host = parsed.host;
+    if (parsed.portExplicit && parsed.port !== undefined) {
+      form.value.port = parsed.port;
+      markSqlServerPortExplicit();
+      resetTestState();
+    }
+  }
+}
+
+function handleHostPaste(event: ClipboardEvent) {
+  if (form.value.db_type === "sqlserver") {
+    const text = event.clipboardData?.getData("text") || "";
+    if (text.includes(",") || text.toLowerCase().startsWith("tcp:") || text.includes(":")) {
+      const parsed = parseSqlServerHostPort(text, form.value.port);
+      if (parsed.portExplicit) {
+        event.preventDefault();
+        form.value.host = parsed.host;
+        form.value.port = parsed.port!;
+        markSqlServerPortExplicit();
+        resetTestState();
+      }
+    }
+  }
 }
 
 const keepaliveEnabled = computed({
@@ -3144,8 +3173,8 @@ watch(
         driver_label: config.driver_label || oceanbasePatch?.driver_label || driverProfiles[profile]?.label || config.db_type,
         ...savedMysqlTlsFormFields(config),
         agent_java_options: config.agent_java_options || [],
-        host: config.db_type === "h2" && h2FilePathFromJdbcUrl(config.connection_string) ? h2FilePathFromJdbcUrl(config.connection_string) : config.host,
-        port: profile === "tdengine" && (config.port === 0 || config.port === 6030) ? 6041 : config.port,
+        host: config.db_type === "sqlserver" ? parseSqlServerHostPort(config.host, config.port).host : config.db_type === "h2" && h2FilePathFromJdbcUrl(config.connection_string) ? h2FilePathFromJdbcUrl(config.connection_string) : config.host,
+        port: config.db_type === "sqlserver" ? (parseSqlServerHostPort(config.host, config.port).port ?? config.port) : profile === "tdengine" && (config.port === 0 || config.port === 6030) ? 6041 : config.port,
         username: config.username,
         password: config.password,
         // Show the index the backend actually connects with; legacy dirty values
@@ -3195,9 +3224,15 @@ watch(
         production_databases: config.production_databases || [],
         production_badge_scope: sidebarProductionBadgeScope(config),
         visible_databases: config.visible_databases,
+        // 通配符筛选由侧栏弹窗维护；编辑连接时也要带上，否则保存会把它清掉，
+        // “显示全部（含系统库）”的 `%` 也会在下次打开编辑器时丢失。
+        visible_database_patterns: config.visible_database_patterns,
         visible_schemas: config.visible_schemas,
         save_password: config.save_password !== false,
       };
+      if (config.db_type === "sqlserver" && parseSqlServerHostPort(config.host, config.port).portExplicit) {
+        markSqlServerPortExplicit();
+      }
       redisKeyTemplatesText.value = redisKeyTemplatesToTextarea(form.value.redis_key_templates);
       oracleTnsAdminPath.value = parseOracleTnsConnectionString(config.connection_string)?.tnsAdmin || "";
       productionProtectionEnabled.value = !!config.is_production || (config.production_databases?.length ?? 0) > 0;
@@ -3846,7 +3881,12 @@ const isH2FileMode = computed(() => form.value.db_type === "h2" && h2ConnectionM
 const isH2CustomDriver = computed(() => form.value.db_type === "h2" && form.value.driver_profile === "h2-custom");
 const usesLocalFilePathInput = computed(() => isLocalFileTypeDb(form.value.db_type) && (form.value.db_type !== "h2" || isH2FileMode.value));
 
-const connectionUrlPlaceholder = computed(() => getUrlPlaceholder(form.value.db_type, form.value.driver_profile));
+const connectionUrlPlaceholder = computed(() => {
+  if (form.value.db_type === "h2") {
+    return isH2FileMode.value ? getUrlPlaceholder("h2", "file") : getUrlPlaceholder("h2", form.value.driver_profile);
+  }
+  return getUrlPlaceholder(form.value.db_type, form.value.driver_profile);
+});
 const jdbcUsernamePlaceholder = computed(() => (form.value.driver_profile === "dremio" || isJdbcProductConnection.value ? "" : "sa"));
 const filePathPlaceholder = computed(() => {
   if (form.value.db_type === "duckdb") return "/path/to/database.duckdb or :memory:";
@@ -5165,6 +5205,14 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     config.password = config.password.trim();
     config.database = undefined;
   } else if (config.db_type === "sqlserver") {
+    const parsed = parseSqlServerHostPort(config.host, config.port);
+    config.host = parsed.host;
+    if (parsed.portExplicit && parsed.port !== undefined) {
+      config.port = parsed.port;
+      setSqlServerPortExplicit(config, true);
+      form.value.host = parsed.host;
+      form.value.port = parsed.port;
+    }
     if (!connectionUpdateExternalConfigPreserved(config)) config.external_config = sqlServerPortExplicitFromConfig(config) ? { portExplicit: true } : undefined;
   } else if (supportsGaussdbIdentifierQuoteStyle(config)) {
     const style = gaussdbIdentifierQuoteStyle(config);
@@ -6097,8 +6145,13 @@ function showAllVisibleDatabases() {
   if (visibleFilterUsesSchemas.value) {
     handleDraftSchemasShowAll();
     form.value.visible_databases = undefined;
+    // schema 模式下的兜底通配符同样会重新隐藏对象；"显示全部"要一并清掉。
+    form.value.visible_database_patterns = undefined;
   } else {
     form.value.visible_databases = undefined;
+    // 未筛选时系统库默认隐藏。用户展开系统库后点“显示全部”，说明全选范围包含系统库：
+    // 用全匹配通配符记住这一意图，既不冻结当前库名，之后新建的库也仍然自动可见。
+    form.value.visible_database_patterns = visibleDatabaseShowSystem.value && visibleDatabaseHasSystemObjects.value ? [MATCH_ALL_VISIBLE_DATABASE_PATTERN] : undefined;
   }
   visibleDatabaseSelection.value = new Set();
   visibleDatabaseNames.value = [];
@@ -6122,12 +6175,14 @@ function saveVisibleDatabaseSelection() {
       defaultVisibleNames: defaultListedVisibleDatabaseNames.value,
       configured: form.value.visible_databases,
       configuredPatterns: form.value.visible_database_patterns,
-      patterns: form.value.visible_database_patterns ?? [],
+      patterns: visibleDatabasePatternsWithoutMatchAll(form.value.visible_database_patterns),
     });
     if (action.type === "clear") {
       form.value.visible_databases = undefined;
+      form.value.visible_database_patterns = undefined;
     } else if (action.type === "set") {
       form.value.visible_databases = action.databaseNames;
+      form.value.visible_database_patterns = action.patterns.length > 0 ? action.patterns : undefined;
     }
   }
   showVisibleDatabasesDialog.value = false;
@@ -6357,6 +6412,14 @@ function applyConnectionDraftToForm(draft: ConnectionDeepLinkDraft) {
     selectedType.value = "gbase";
   }
   customDriverName.value = isCustomCompatibleProfile() ? draft.driverLabel : "";
+  if (form.value.db_type === "sqlserver") {
+    const parsed = parseSqlServerHostPort(form.value.host, form.value.port);
+    form.value.host = parsed.host;
+    if (parsed.portExplicit && parsed.port !== undefined) {
+      form.value.port = parsed.port;
+      markSqlServerPortExplicit();
+    }
+  }
   mongoUseUrl.value = !!draft.useMongoUrl;
   if (draft.name?.trim()) {
     form.value.name = draft.name.trim();
@@ -9271,7 +9334,7 @@ function openExternalUrl(url: string) {
                     </div>
                     <div v-else-if="form.db_type !== 'oracle' || form.oracle_connection_type !== 'tns'" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ form.db_type === "elasticsearch" && elasticsearchConnectionMode === "kibana" ? t("connection.elasticsearchKibanaHost") : t("connection.host") }}</Label>
-                      <Input v-model="form.host" class="col-span-2" />
+                      <Input v-model="form.host" class="col-span-2" @blur="handleHostBlur" @paste="handleHostPaste" />
                       <Input v-model.number="form.port" type="number" class="col-span-1" @input="markSqlServerPortExplicit" />
                     </div>
 
