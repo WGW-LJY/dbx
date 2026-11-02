@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, shallowRef, watch } from "vue";
 import { uuid } from "@/lib/common/utils";
+import { copyToClipboard } from "@/lib/common/clipboard";
 import { useI18n } from "vue-i18n";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { Dialog, DialogHeader, DialogTitle, DialogFooter, DialogScrollContent } from "@/components/ui/dialog";
@@ -101,6 +102,7 @@ interface BatchImportTask {
   columnDataTypes: Record<string, string>;
   status: "pending" | "running" | "done" | "error" | "cancelled";
   rowsImported: number;
+  rowsFailed: number;
   error?: string;
 }
 
@@ -154,6 +156,9 @@ const cancelling = ref(false);
 const importId = ref("");
 const progress = ref<api.TableImportProgress | null>(null);
 const errorMessage = ref("");
+// A SQL file that table import cannot preview (multi-table dump, DDL, REPLACE, expressions) is a
+// script for the SQL file executor; remember it so the dialog can offer that hand-off.
+const sqlScriptFallbackSource = ref<ImportSource | null>(null);
 const wizardStep = ref<TableImportWizardStep>("source");
 const fileInput = ref<HTMLInputElement | null>(null);
 const navicatBackupInput = ref<HTMLInputElement | null>(null);
@@ -165,6 +170,9 @@ const dataStartRow = ref(2);
 const lastDataRow = ref(0);
 const trimValues = ref(false);
 const conflictPolicy = ref<api.TableImportConflictPolicy>("error");
+// Off by default: a failed statement must still stop the import unless the
+// user explicitly asks to skip failed rows (issue #13683).
+const continueOnError = ref(false);
 const emptyStringAsNull = ref(defaultTableImportEmptyStringAsNull(sourceFormat.value));
 const selectedSheet = ref("");
 const jsonShape = ref<api.TableImportJsonShape>("auto");
@@ -367,14 +375,16 @@ const createColumnSummaries = computed(() =>
 const parseOptions = computed<api.TableImportParseOptions>(() => taskParseOptions(sourceFormat.value, selectedSheet.value));
 const terminalStatus = computed(() => !!progress.value?.status && ["done", "error", "cancelled"].includes(progress.value.status));
 const displayedElapsedMs = computed(() => resolveTableImportElapsed(liveElapsedMs.value, progress.value?.elapsedMs, terminalStatus.value));
-// Source file the live progress belongs to (#13164): the queue runs one file
-// at a time, so the running task is whatever activeTaskIndex points at; the
-// single-file path has no task entry and reads the preview directly.
+// Source file the progress belongs to (#13164): the queue runs one file at a
+// time, so the active task is whatever activeTaskIndex points at; the
+// single-file path has no task entry and reads the preview directly. The file
+// stays visible once the run finishes, so the completion screen still says
+// which file was imported (#13495).
 const activeImportFile = computed(() => {
-  if (wizardStep.value !== "execution" || !running.value) return "";
+  if (wizardStep.value !== "execution") return "";
   if (isBatchImport.value) {
     const task = batchTasks.value[activeTaskIndex.value];
-    return task?.status === "running" ? task.preview.filePath || task.preview.fileName || "" : "";
+    return task ? task.preview.filePath || task.preview.fileName || "" : "";
   }
   return preview.value?.filePath || "";
 });
@@ -383,6 +393,26 @@ const progressLabelKey = computed(() => {
   if (!running.value && !progress.value) return "tableImport.status_idle";
   return `tableImport.phase_${progress.value?.phase || "writing"}`;
 });
+const importFailures = computed(() => progress.value?.failures ?? []);
+const failedRowListText = computed(() =>
+  importFailures.value
+    .map((failure) => {
+      const row = t("tableImport.failureRow", { row: failure.row });
+      const table = failure.table ? `${t("tableImport.failureTable", { table: failure.table })} · ` : "";
+      return `${table}${row}: ${failure.error}`;
+    })
+    .join("\n"),
+);
+
+function importSummaryMessage(imported: number, failed: number): string {
+  return failed > 0 ? t("tableImport.successWithFailures", { count: imported, failed }) : t("tableImport.success", { count: imported });
+}
+
+async function copyFailedRows() {
+  if (!failedRowListText.value) return;
+  await copyToClipboard(failedRowListText.value);
+  toast(t("tableImport.failedRowsCopied"), 2000);
+}
 
 function previewRowsLabel(currentPreview: api.TableImportPreview | null | undefined): string {
   if (!currentPreview) return "-";
@@ -511,6 +541,7 @@ function resetState() {
   lastDataRow.value = 0;
   trimValues.value = false;
   conflictPolicy.value = "error";
+  continueOnError.value = false;
   emptyStringAsNull.value = defaultTableImportEmptyStringAsNull(sourceFormat.value);
   selectedSheet.value = "";
   jsonShape.value = "auto";
@@ -530,6 +561,7 @@ function resetState() {
   importId.value = "";
   progress.value = null;
   errorMessage.value = "";
+  sqlScriptFallbackSource.value = null;
   wizardStep.value = "source";
 }
 
@@ -868,6 +900,7 @@ async function loadPreview(fileOrPath = selectedSource.value) {
   const requestId = ++previewRequestId;
   loadingPreview.value = true;
   errorMessage.value = "";
+  sqlScriptFallbackSource.value = null;
   try {
     const nextPreview = await previewSelectedImportFile(fileOrPath);
     if (requestId !== previewRequestId) return;
@@ -883,6 +916,7 @@ async function loadPreview(fileOrPath = selectedSource.value) {
     columnMapping.value = {};
     columnDataTypes.value = {};
     errorMessage.value = String(e?.message || e);
+    if (sourceFormat.value === "sql") sqlScriptFallbackSource.value = fileOrPath;
   } finally {
     if (requestId === previewRequestId) loadingPreview.value = false;
   }
@@ -905,6 +939,7 @@ function assignSelectedSource(source: string | File) {
   columnDataTypes.value = {};
   progress.value = null;
   errorMessage.value = "";
+  sqlScriptFallbackSource.value = null;
   const name = typeof source === "string" ? source : source.name;
   sourceFormat.value = detectedFormat;
   emptyStringAsNull.value = defaultTableImportEmptyStringAsNull(sourceFormat.value);
@@ -955,8 +990,11 @@ async function prepareBatchSources(sources: ImportSource[]) {
     return;
   }
   emptyStringAsNull.value = formats.length && formats.every((format) => format === formats[0]) ? defaultTableImportEmptyStringAsNull(formats[0]!) : defaultTableImportEmptyStringAsNull(formats[0] ?? "csv");
+  sqlScriptFallbackSource.value = null;
+  let previewingSource: ImportSource | undefined;
   try {
     for (const [index, source] of sources.entries()) {
+      previewingSource = source;
       const format = formats[index]!;
       const initialPreview = await api.previewTableImportFile(source, {
         connectionId: props.prefillConnectionId,
@@ -994,6 +1032,7 @@ async function prepareBatchSources(sources: ImportSource[]) {
           columnDataTypes: suggestImportTargetDataTypes(taskPreview.columns, taskPreview.rows, structureDatabaseType.value),
           status: "pending",
           rowsImported: 0,
+          rowsFailed: 0,
         });
       }
     }
@@ -1006,6 +1045,7 @@ async function prepareBatchSources(sources: ImportSource[]) {
   } catch (e: any) {
     batchTasks.value = [];
     errorMessage.value = String(e?.message || e);
+    if (previewingSource !== undefined && detectFormat(sourceName(previewingSource)) === "sql") sqlScriptFallbackSource.value = previewingSource;
   } finally {
     loadingPreview.value = false;
   }
@@ -1045,7 +1085,7 @@ async function applySelectedSources(sources: ImportSource[]) {
   // A Navicat archive restores a whole database, so only a single-file selection may
   // take that path; a mixed batch must stay in the table-import flow for the other files.
   const navicatBackup = supportsNavicatBackupImport.value && sources.length === 1 ? sources.find((source) => sourceName(source).toLowerCase().endsWith(`.${NAVICAT_BACKUP_FORMAT}`)) : undefined;
-  if (navicatBackup) await openNavicatBackupRestore(navicatBackup);
+  if (navicatBackup) await openSqlFileExecutor(navicatBackup);
   else if (targetMode.value === "create") await prepareBatchSources(sources);
   else assignSelectedSource(sources[0]!);
 }
@@ -1062,21 +1102,22 @@ async function selectNavicatBackupFile() {
   }
   const { open } = await import("@tauri-apps/plugin-dialog");
   const selected = await open({ multiple: false, filters: [NAVICAT_BACKUP_FILTER] });
-  if (typeof selected === "string") await openNavicatBackupRestore(selected);
+  if (typeof selected === "string") await openSqlFileExecutor(selected);
 }
 
 async function handleNavicatBackupInputChange(event: Event) {
   const input = event.target as HTMLInputElement;
   const file = input.files?.[0];
   input.value = "";
-  if (file && !running.value) await openNavicatBackupRestore(file);
+  if (file && !running.value) await openSqlFileExecutor(file);
 }
 
 /**
- * Navicat archives hold whole databases (DDL, rows, routines, triggers), so they are
- * restored by the SQL file executor, prefilled with this dialog's target database.
+ * Navicat archives and whole-database SQL dumps hold DDL, rows, routines and triggers rather
+ * than rows for one table, so they run through the streaming SQL file executor, prefilled
+ * with this dialog's target database.
  */
-async function openNavicatBackupRestore(source: ImportSource) {
+async function openSqlFileExecutor(source: ImportSource) {
   const connectionId = props.prefillConnectionId;
   if (!connectionId) return;
   const target = { connectionId, database: props.prefillDatabase || "", ...(props.prefillSchema ? { schema: props.prefillSchema } : {}) };
@@ -1365,6 +1406,7 @@ async function startImport() {
         batchSize: Math.max(1, Number(batchSize.value) || 500),
         conflictPolicy: conflictPolicy.value,
         skipDuplicateRows: conflictPolicy.value === "skip",
+        continueOnError: continueOnError.value,
         dateTimeFormat: settingsStore.editorSettings.globalDateTimeImportFormat || undefined,
         preparedSource: preparedImportSource(currentPreview),
       },
@@ -1372,8 +1414,17 @@ async function startImport() {
         progress.value = { ...nextProgress, elapsedMs: nextProgress.elapsedMs ?? liveElapsedMs.value };
       },
     );
-    progress.value = { importId: summary.importId, status: "done", rowsImported: summary.rowsImported, totalRows: summary.totalRows, elapsedMs: summary.elapsedMs };
-    toast(t("tableImport.success", { count: summary.rowsImported }), 2500);
+    progress.value = {
+      importId: summary.importId,
+      status: "done",
+      rowsImported: summary.rowsImported,
+      totalRows: summary.totalRows,
+      elapsedMs: summary.elapsedMs,
+      rowsFailed: summary.rowsFailed ?? 0,
+      failures: summary.failures ?? [],
+      failuresTruncated: summary.failuresTruncated ?? false,
+    };
+    toast(importSummaryMessage(summary.rowsImported, summary.rowsFailed ?? 0), 2500);
     store.invalidateMetadataCache(props.prefillConnectionId, props.prefillDatabase || "", targetSchema.value || undefined, tableName);
     if (targetMode.value === "create") {
       store.refreshObjectListTreeNode(props.prefillConnectionId, props.prefillDatabase || "", targetSchema.value || undefined).catch((error) => {
@@ -1390,6 +1441,10 @@ async function startImport() {
       totalRows: progress.value?.totalRows ?? currentPreview.totalRows,
       elapsedMs: progress.value?.elapsedMs ?? liveElapsedMs.value,
       error: message,
+      // Keep failed rows already reported before the fatal error/cancel (#13683).
+      rowsFailed: progress.value?.rowsFailed ?? 0,
+      failures: progress.value?.failures ?? [],
+      failuresTruncated: progress.value?.failuresTruncated ?? false,
     };
   } finally {
     refreshImportElapsedClock();
@@ -1416,6 +1471,9 @@ async function startBatchImport() {
   const totalBytes = tasks.reduce((sum, { task }) => sum + task.preview.sizeBytes, 0);
   let completedRows = 0;
   let completedBytes = 0;
+  let completedFailures = 0;
+  let completedFailureList: api.TableImportFailure[] = [];
+  let completedFailuresTruncated = false;
   importId.value = uuid();
   startImportElapsedClock();
   progress.value = { importId: importId.value, status: "running", phase: "preparing", rowsImported: 0, totalRows, totalRowsExact, bytesRead: 0, totalBytes, elapsedMs: 0 };
@@ -1466,12 +1524,14 @@ async function startBatchImport() {
           batchSize: Math.max(1, Number(batchSize.value) || 500),
           conflictPolicy: conflictPolicy.value,
           skipDuplicateRows: conflictPolicy.value === "skip",
+          continueOnError: continueOnError.value,
           dateTimeFormat: settingsStore.editorSettings.globalDateTimeImportFormat || undefined,
           preparedSource: preparedImportSource(task.preview),
           retainSource: true,
         },
         (nextProgress) => {
           task.rowsImported = nextProgress.rowsImported;
+          task.rowsFailed = nextProgress.rowsFailed ?? 0;
           const hasRemainingTasks = queueIndex < tasks.length - 1;
           const aggregateStatus = nextProgress.status === "done" && hasRemainingTasks ? "running" : nextProgress.status;
           const aggregatePhase = nextProgress.status === "done" && hasRemainingTasks ? "preparing" : nextProgress.phase;
@@ -1480,6 +1540,9 @@ async function startBatchImport() {
             status: aggregateStatus,
             phase: aggregatePhase,
             rowsImported: completedRows + nextProgress.rowsImported,
+            rowsFailed: completedFailures + (nextProgress.rowsFailed ?? 0),
+            failures: [...completedFailureList, ...(nextProgress.failures ?? [])],
+            failuresTruncated: completedFailuresTruncated || !!nextProgress.failuresTruncated,
             totalRows,
             totalRowsExact,
             bytesRead: completedBytes + (nextProgress.bytesRead ?? 0),
@@ -1490,13 +1553,30 @@ async function startBatchImport() {
       );
       task.status = "done";
       task.rowsImported = summary.rowsImported;
+      task.rowsFailed = summary.rowsFailed ?? 0;
       completedRows += summary.rowsImported;
+      completedFailures += summary.rowsFailed ?? 0;
+      completedFailureList = [...completedFailureList, ...(summary.failures ?? [])];
+      completedFailuresTruncated ||= summary.failuresTruncated ?? false;
       completedBytes += task.preview.sizeBytes;
       store.invalidateMetadataCache(props.prefillConnectionId, props.prefillDatabase || "", targetSchema.value || undefined, task.tableName);
     }
     refreshImportElapsedClock();
-    progress.value = { importId: importId.value, status: "done", phase: "done", rowsImported: completedRows, totalRows: completedRows, totalRowsExact: true, bytesRead: totalBytes, totalBytes, elapsedMs: liveElapsedMs.value };
-    toast(t("tableImport.success", { count: completedRows }), 2500);
+    progress.value = {
+      importId: importId.value,
+      status: "done",
+      phase: "done",
+      rowsImported: completedRows,
+      rowsFailed: completedFailures,
+      failures: completedFailureList,
+      failuresTruncated: completedFailuresTruncated,
+      totalRows: completedRows,
+      totalRowsExact: true,
+      bytesRead: totalBytes,
+      totalBytes,
+      elapsedMs: liveElapsedMs.value,
+    };
+    toast(importSummaryMessage(completedRows, completedFailures), 2500);
     store.refreshObjectListTreeNode(props.prefillConnectionId, props.prefillDatabase || "", targetSchema.value || undefined).catch((error) => {
       console.warn("[DBX][table-import:refresh-created-table-failed]", error);
     });
@@ -1515,6 +1595,9 @@ async function startBatchImport() {
       totalRows,
       elapsedMs: progress.value?.elapsedMs ?? liveElapsedMs.value,
       error: message,
+      rowsFailed: progress.value?.rowsFailed ?? completedFailures,
+      failures: progress.value?.failures ?? completedFailureList,
+      failuresTruncated: progress.value?.failuresTruncated ?? completedFailuresTruncated,
     };
   } finally {
     refreshImportElapsedClock();
@@ -1734,6 +1817,7 @@ watch(rawProgressPercent, (percent) => {
                 <FileText v-else class="h-3.5 w-3.5 shrink-0" />
                 <span class="truncate">{{ task.tableName }}</span>
                 <span v-if="!task.preview.rows.length" class="shrink-0 text-muted-foreground">{{ t("tableImport.rows") }}: 0</span>
+                <span v-else-if="task.rowsFailed > 0" class="shrink-0 text-amber-600 dark:text-amber-400">{{ t("tableImport.failedRows", { count: task.rowsFailed }) }}</span>
               </button>
             </div>
           </div>
@@ -2025,6 +2109,14 @@ watch(rawProgressPercent, (percent) => {
             <p v-if="targetMode === 'existing' && !canSelectUpdateExisting" class="text-[11px] text-muted-foreground">
               {{ updateExistingDisabledReason }}
             </p>
+          </div>
+
+          <div class="space-y-1 rounded-md border p-3">
+            <label class="flex items-center gap-2 text-xs">
+              <input v-model="continueOnError" type="checkbox" data-testid="table-import-continue-on-error" class="h-3.5 w-3.5 accent-primary" />
+              {{ t("tableImport.continueOnError") }}
+            </label>
+            <p class="text-[11px] text-muted-foreground">{{ t("tableImport.continueOnErrorHint") }}</p>
           </div>
 
           <div class="flex items-center gap-2">
@@ -2352,6 +2444,9 @@ watch(rawProgressPercent, (percent) => {
                   <template v-else>{{ progress?.rowsImported ?? 0 }} {{ t("tableImport.rowsImported") }}</template>
                   · {{ progressPercent }}% ·
                   {{ t("tableImport.elapsed", { duration: formatTableImportElapsed(displayedElapsedMs) }) }}
+                  <template v-if="(progress?.rowsFailed ?? 0) > 0">
+                    · <span class="text-amber-600 dark:text-amber-400">{{ t("tableImport.failedRows", { count: progress?.rowsFailed ?? 0 }) }}</span>
+                  </template>
                 </div>
               </div>
             </div>
@@ -2371,6 +2466,26 @@ watch(rawProgressPercent, (percent) => {
           <div v-if="errorMessage || progress?.error" class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
             {{ errorMessage || progress?.error }}
           </div>
+          <div v-if="terminalStatus && importFailures.length" class="rounded-md border border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/20">
+            <div class="flex items-center gap-2 border-b border-amber-200 px-3 py-2 text-xs font-medium text-amber-900 dark:border-amber-800 dark:text-amber-200">
+              <AlertTriangle class="h-3.5 w-3.5 shrink-0" />
+              <span class="flex-1">{{ t("tableImport.failedRowsTitle") }}</span>
+              <Button variant="outline" size="sm" class="h-6 px-2 text-xs" data-testid="table-import-copy-failures" @click="copyFailedRows">
+                {{ t("tableImport.copyFailedRows") }}
+              </Button>
+            </div>
+            <div class="max-h-40 overflow-auto p-2" data-testid="table-import-failures">
+              <div v-for="(failure, index) in importFailures" :key="`${failure.table}-${failure.row}-${index}`" class="flex gap-2 rounded px-1 py-0.5 text-[11px] font-mono">
+                <span class="shrink-0 text-amber-700 dark:text-amber-300">
+                  <template v-if="failure.table">{{ t("tableImport.failureTable", { table: failure.table }) }} · </template>{{ t("tableImport.failureRow", { row: failure.row }) }}:
+                </span>
+                <span class="min-w-0 break-all text-foreground">{{ failure.error }}</span>
+              </div>
+            </div>
+            <p v-if="progress?.failuresTruncated" class="px-3 pb-2 text-[11px] text-amber-800 dark:text-amber-300">
+              {{ t("tableImport.failureListTruncated", { count: importFailures.length }) }}
+            </p>
+          </div>
         </div>
 
         <div v-if="loadingTarget" class="flex items-center gap-2 text-xs text-muted-foreground">
@@ -2381,6 +2496,12 @@ watch(rawProgressPercent, (percent) => {
           <span class="flex-1">{{ errorMessage }}</span>
           <Button v-if="targetMode === 'existing' && !loadingTarget && !existingTargetMetadataReady" variant="outline" size="sm" class="h-6 px-2 text-xs" @click="loadTargetColumns()">
             {{ t("tableImport.retry") }}
+          </Button>
+        </div>
+        <div v-if="sqlScriptFallbackSource && props.prefillConnectionId" class="flex items-center gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+          <span class="flex-1">{{ t("tableImport.sqlScriptHint") }}</span>
+          <Button variant="outline" size="sm" class="h-6 shrink-0 px-2 text-xs" :disabled="loadingPreview || running" @click="openSqlFileExecutor(sqlScriptFallbackSource)">
+            {{ t("tableImport.sqlScriptRun") }}
           </Button>
         </div>
       </div>

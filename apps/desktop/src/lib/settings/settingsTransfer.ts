@@ -216,7 +216,6 @@ const SETTINGS_TRANSFER_CATEGORY_KEYS: Record<SettingsTransferCategoryId, readon
     "sidebarObjectInfoMode",
     "sidebarAllowHorizontalScroll",
     "sidebarShowTooltips",
-    "sidebarShowUserAdmin",
     "sidebarIndent",
     "sidebarFontSize",
     "sidebarDensity",
@@ -292,7 +291,7 @@ const SETTINGS_TRANSFER_CATEGORY_KEYS: Record<SettingsTransferCategoryId, readon
   ],
   shortcuts: ["shortcuts", "sqlShortcuts"],
   snippets: ["snippets", "snippetTriggerKey"],
-  other: ["updateDownloadSource", "updateNotificationsEnabled", "autoDownloadUpdates", "autoUpdateApp", "autoUpdateDrivers", "autoUpdateJdbc", "autoUpdateMcp", "autoUpdatePlugins"],
+  other: ["updateDownloadSource", "updateChannel", "updateNotificationsEnabled", "autoDownloadUpdates", "autoUpdateApp", "autoUpdateDrivers", "autoUpdateJdbc", "autoUpdateMcp", "autoUpdatePlugins"],
 };
 
 const KEY_TO_CATEGORY = new Map<string, SettingsTransferCategoryId>();
@@ -398,7 +397,6 @@ const PASS_THROUGH_BOOLEAN_KEYS = [
   "sidebarPinDefaultDatabase",
   "sidebarAllowHorizontalScroll",
   "sidebarShowTooltips",
-  "sidebarShowUserAdmin",
   "updateNotificationsEnabled",
   "autoDownloadUpdates",
   "autoUpdateApp",
