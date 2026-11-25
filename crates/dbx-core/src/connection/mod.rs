@@ -3204,6 +3204,7 @@ impl AppState {
                 }
             };
             let shutdown = async {
+                #[allow(unused_mut)]
                 let mut removed_pools = self.drain_all_connection_pools().await;
                 #[cfg(feature = "mq-admin")]
                 self.persist_removed_mqtt_history(&mut removed_pools).await;
@@ -3224,6 +3225,7 @@ impl AppState {
             }
             return;
         }
+        #[allow(unused_mut)]
         let mut removed_pools = self.drain_all_connection_pools().await;
         #[cfg(feature = "mq-admin")]
         self.persist_removed_mqtt_history(&mut removed_pools).await;
@@ -7716,6 +7718,7 @@ impl AppState {
         let debug_fence = crate::query::pl_debug::drain_connection(self, connection_id, "connection_removed").await?;
         self.invalidate_connection_lifecycle(connection_id);
         self.rollback_manual_transaction_sessions(connection_id).await;
+        #[allow(unused_mut)]
         let mut removed = self.drain_connection_pools(connection_id).await;
         self.clear_metadata_gates_for_connection(connection_id).await;
         #[cfg(feature = "mq-admin")]
@@ -7760,6 +7763,7 @@ impl AppState {
         let debug_fence = crate::query::pl_debug::drain_connection(self, connection_id, "connection_removed").await?;
         self.invalidate_connection_lifecycle(connection_id);
         self.rollback_manual_transaction_sessions(connection_id).await;
+        #[allow(unused_mut)]
         let mut removed = self.drain_connection_pools(connection_id).await;
         self.clear_metadata_gates_for_connection(connection_id).await;
         #[cfg(feature = "mq-admin")]
@@ -9662,6 +9666,7 @@ mod tests {
             transport_layers: Vec::new(),
             connect_timeout_secs: default_connect_timeout_secs(),
             query_timeout_secs: crate::models::connection::default_query_timeout_secs(),
+            write_timeout_secs: 0,
             idle_timeout_secs: crate::models::connection::default_idle_timeout_secs(),
             manual_transaction_timeout_secs: crate::models::connection::default_manual_transaction_timeout_secs(),
             idle_disconnect_secs: crate::models::connection::default_idle_disconnect_secs(),
@@ -13672,6 +13677,7 @@ sleep 30
             transport_layers: Vec::new(),
             connect_timeout_secs: 1,
             query_timeout_secs: 30,
+            write_timeout_secs: 0,
             idle_timeout_secs: 60,
             manual_transaction_timeout_secs: 300,
             idle_disconnect_secs: 0,
